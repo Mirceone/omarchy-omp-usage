@@ -7,8 +7,8 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "mirceone.omp-usage"
-  ipcTarget: "mirceone.omp-usage"
+  moduleName: "omp.usage-monitor"
+  ipcTarget: "omp.usage-monitor"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "mirceone.omp-usage",
+  "id": "omp.usage-monitor",
   "name": "OMP Usage",
   "version": "0.1.0",
   "author": "Mirceone",
