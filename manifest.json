@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "mirceone.omp-usage",
+  "name": "OMP Usage",
+  "version": "0.1.0",
+  "author": "Mirceone",
+  "license": "MIT",
+  "description": "Oh My Pi subscription limits and usage in the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OMP Usage",
+    "description": "Usage limits for every subscription authenticated in Oh My Pi.",
+    "category": "AI",
+    "aliases": ["omp", "pi", "usage"],
+    "allowMultiple": false,
+    "defaults": {
+      "refreshIntervalSec": 300
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      }
+    ]
+  }
+}
