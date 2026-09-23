@@ -617,17 +617,26 @@ Panel {
       readonly property color primaryColor: primary && (primary.alarming || root.hiddenAlarm) ? button.activeColor : lit
       readonly property color secondaryColor: secondary && (secondary.alarming || root.hiddenAlarm) ? button.activeColor : lit
 
-      // Bars: 3px wide, 1px apart, 3/5/7/9px tall on a shared baseline.
-      // Alone they sit centered; with a second account they share the canvas.
+      // Laid out in physical pixels (u) so fractional display scaling keeps
+      // segments even: 3px wide, 1px apart, bars 3/5/7/9px tall, 3px squares,
+      // 3px between rows, 1px corner radius. Centered in the icon canvas.
+      // Window ratio, not Screen: Wayland reports Screen at the rounded-up
+      // integer scale (2 on a 1.25x output).
+      readonly property real u: 1 / Math.max(1, Window.window ? Window.window.devicePixelRatio : 1)
+      readonly property real contentWidth: 15 * u
+      readonly property real contentHeight: (secondary ? 15 : 9) * u
+      readonly property real originX: (width - contentWidth) / 2
+      readonly property real originY: (height - contentHeight) / 2
+
       Repeater {
         model: 4
         Rectangle {
           required property int index
-          x: 1 + index * 4
-          width: 3
-          height: 3 + index * 2
-          y: (signal.secondary ? 10 : 13) - height
-          antialiasing: false
+          x: signal.originX + index * 4 * signal.u
+          width: 3 * signal.u
+          height: (3 + index * 2) * signal.u
+          y: signal.originY + 9 * signal.u - height
+          radius: signal.u
           color: signal.primary && index < signal.primary.level ? signal.primaryColor : signal.dimmed
         }
       }
@@ -636,11 +645,11 @@ Panel {
         model: signal.secondary ? 4 : 0
         Rectangle {
           required property int index
-          x: 1 + index * 4
-          y: 13
-          width: 3
-          height: 3
-          antialiasing: false
+          x: signal.originX + index * 4 * signal.u
+          y: signal.originY + 12 * signal.u
+          width: 3 * signal.u
+          height: 3 * signal.u
+          radius: signal.u
           color: index < signal.secondary.level ? signal.secondaryColor : signal.dimmed
         }
       }
