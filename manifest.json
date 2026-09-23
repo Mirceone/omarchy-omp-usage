@@ -2,20 +2,26 @@
   "schemaVersion": 1,
   "id": "omp.usage-monitor",
   "name": "OMP Usage",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "author": "Mirceone",
   "license": "MIT",
-  "description": "Oh My Pi subscription limits and usage in the Omarchy bar.",
-  "kinds": ["bar-widget"],
+  "description": "Signal-bar usage meter for every AI subscription logged in to Oh My Pi: limits, plans, and resets in one panel.",
+  "kinds": [
+    "bar-widget"
+  ],
   "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "OMP Usage",
-    "description": "Usage limits for every subscription authenticated in Oh My Pi.",
+    "description": "Signal-bar usage meter and panel for every account logged in to Oh My Pi.",
     "category": "AI",
-    "aliases": ["omp", "pi", "usage"],
+    "aliases": [
+      "omp",
+      "pi",
+      "usage"
+    ],
     "allowMultiple": false,
     "defaults": {
       "refreshIntervalSec": 300
@@ -30,6 +36,8 @@
         "step": 30,
         "defaultValue": 300
       }
-    ]
-  }
+    ],
+    "defaultSection": "right"
+  },
+  "repository": "https://github.com/Mirceone/omarchy-omp-usage"
 }
