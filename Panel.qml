@@ -51,6 +51,31 @@ Panel {
     })
   }
 
+  readonly property var reportsByKey: {
+    var map = {}
+    for (var i = 0; i < displayReports.length; i++) map[reportKey(displayReports[i])] = displayReports[i]
+    return map
+  }
+
+  onDisplayReportsChanged: syncSections()
+
+  // Bring sectionModel to the displayReports order with moves/inserts/removes
+  // only, so existing section delegates are kept rather than recreated.
+  function syncSections() {
+    var keys = displayReports.map(reportKey)
+    for (var i = 0; i < keys.length; i++) {
+      if (i < sectionModel.count && sectionModel.get(i).key === keys[i]) continue
+      var found = -1
+      for (var j = i + 1; j < sectionModel.count; j++)
+        if (sectionModel.get(j).key === keys[i]) { found = j; break }
+      if (found >= 0) sectionModel.move(found, i, 1)
+      else sectionModel.insert(i, { key: keys[i] })
+    }
+    while (sectionModel.count > keys.length) sectionModel.remove(sectionModel.count - 1)
+  }
+
+  ListModel { id: sectionModel }
+
   readonly property bool alarming: {
     for (var r = 0; r < displayReports.length; r++) {
       var limits = displayReports[r].limits || []
@@ -99,6 +124,16 @@ Panel {
     if (report.noUsage) return report.credentialType === "api_key" ? "API key" : "Subscription"
     if (String(metadata.endpoint || "").indexOf("/oauth/") >= 0) return "Subscription"
     return ""
+  }
+
+  // Clear drag state before reordering: the reorder moves the very section
+  // whose mouse handler is calling this.
+  function finishDrag(commit) {
+    var key = dragKey
+    var index = dropIndex
+    dragKey = ""
+    dropIndex = -1
+    if (commit && key !== "" && index >= 0) Qt.callLater(function() { root.moveReport(key, index) })
   }
 
   function moveReport(key, toIndex) {
@@ -583,15 +618,16 @@ Panel {
             }
           }
 
+          // Keyed model: sections survive the 3s refreshes (a plain JS-array
+          // model would rebuild them all, killing any drag in progress).
           Repeater {
             id: sectionRepeater
-            model: root.displayReports
+            model: sectionModel
             ProviderSection {
-              // Index into the JS array: modelData would be converted to a
-              // QVariantMap whose nested lists fail Array.isArray.
-              required property int index
+              required property string key
               width: parent.width
-              report: root.displayReports[index]
+              accountKey: key
+              report: root.reportsByKey[key] || null
             }
           }
 
@@ -631,8 +667,13 @@ Panel {
   component ProviderSection: Column {
     id: section
     property var report: null
-    readonly property string key: report ? root.reportKey(report) : ""
-    opacity: root.dragKey !== "" && root.dragKey === key ? 0.4 : 1
+    property string accountKey: ""
+    readonly property bool dragging: root.dragKey !== "" && root.dragKey === accountKey
+    // Follows the pointer while dragging; the drop line shows the landing spot.
+    property real dragOffset: 0
+    z: dragging ? 10 : 0
+    opacity: dragging ? 0.6 : 1
+    transform: Translate { y: section.dragging ? section.dragOffset : 0 }
     readonly property string iconSource: report ? root.providerIcon(report.provider) : ""
     readonly property int resetCount: report && report.resetCredits ? Number(report.resetCredits.availableCount) || 0 : 0
     spacing: Style.space(10)
@@ -648,24 +689,24 @@ Panel {
         anchors.fill: parent
         z: 1
         preventStealing: true
-        cursorShape: root.dragKey === section.key ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+        cursorShape: section.dragging ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+        property real pressY: 0
         onPressed: function(mouse) {
-          root.dragKey = section.key
-          root.dropIndex = -1
+          pressY = mapToItem(column, mouse.x, mouse.y).y
+          section.dragOffset = 0
         }
         onPositionChanged: function(mouse) {
-          if (root.dragKey !== section.key) return
-          root.dropIndex = root.dropIndexAt(mapToItem(column, mouse.x, mouse.y).y)
+          var y = mapToItem(column, mouse.x, mouse.y).y
+          // Small threshold so a plain click is not a drag.
+          if (!section.dragging) {
+            if (Math.abs(y - pressY) < Style.space(4)) return
+            root.dragKey = section.accountKey
+          }
+          section.dragOffset = y - pressY
+          root.dropIndex = root.dropIndexAt(y)
         }
-        onReleased: function(mouse) {
-          if (root.dropIndex >= 0) root.moveReport(section.key, root.dropIndex)
-          root.dragKey = ""
-          root.dropIndex = -1
-        }
-        onCanceled: {
-          root.dragKey = ""
-          root.dropIndex = -1
-        }
+        onReleased: root.finishDrag(true)
+        onCanceled: root.finishDrag(false)
       }
 
       Item {
