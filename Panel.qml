@@ -28,8 +28,28 @@ Panel {
   property var pending: null
   property var slowNextAt: ({})
   property var slowBackoffMs: ({})
+  // Exact plan / access type per account, from plans.py.
+  property var plans: ({})
+  // Account keys in the order the user dragged them into (persisted).
+  property var savedOrder: []
+  property string dragKey: ""
+  property int dropIndex: -1
 
-  readonly property var displayReports: reports.map(withHistory)
+  readonly property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy/omp-usage-monitor.json"
+
+  readonly property var displayReports: {
+    var list = reports.map(withHistory)
+    var rank = {}
+    for (var i = 0; i < savedOrder.length; i++) rank[savedOrder[i]] = i
+    var position = {}
+    for (var j = 0; j < list.length; j++) position[reportKey(list[j])] = j
+    return list.slice().sort(function(a, b) {
+      var ka = reportKey(a), kb = reportKey(b)
+      var ra = rank[ka] === undefined ? savedOrder.length + position[ka] : rank[ka]
+      var rb = rank[kb] === undefined ? savedOrder.length + position[kb] : rank[kb]
+      return ra - rb
+    })
+  }
 
   readonly property bool alarming: {
     for (var r = 0; r < displayReports.length; r++) {
@@ -59,15 +79,48 @@ Panel {
     return ""
   }
 
-  // Only states what the report actually proves; never guesses "API".
-  function accountText(report) {
+  function formatPlanName(value) {
+    return String(value).split(/[-_ ]+/).map(function(part) {
+      return part ? part[0].toUpperCase() + part.slice(1).toLowerCase() : ""
+    }).join(" ")
+  }
+
+  // Exact plan when any source knows it ("Plus plan", "Pro plan"), otherwise
+  // the universal access type ("Subscription" / "API key").
+  function planText(report) {
     if (!report) return ""
-    if (report.noUsage) return report.credentialType === "api_key" ? "API key" : "Subscription"
     var metadata = report.metadata || {}
-    var plan = String(metadata.planType || "")
-    if (plan) return plan[0].toUpperCase() + plan.slice(1) + " plan"
+    var exact = metadata.planType || metadata.plan || metadata.currentTierName
+    if (exact) return formatPlanName(exact) + " plan"
+    var known = plans[reportKey(report)] || plans[report.provider + "|" + (metadata.email || "")]
+      || plans[report.provider + "|*"]
+    if (known && known.plan) return known.plan + " plan"
+    if (known && known.access) return known.access
+    if (report.noUsage) return report.credentialType === "api_key" ? "API key" : "Subscription"
     if (String(metadata.endpoint || "").indexOf("/oauth/") >= 0) return "Subscription"
-    return String(metadata.email || "")
+    return ""
+  }
+
+  function moveReport(key, toIndex) {
+    var order = displayReports.map(reportKey)
+    var from = order.indexOf(key)
+    if (from < 0 || toIndex < 0) return
+    order.splice(from, 1)
+    order.splice(toIndex > from ? toIndex - 1 : toIndex, 0, key)
+    // Keep positions of accounts that are not logged in right now.
+    for (var i = 0; i < savedOrder.length; i++)
+      if (order.indexOf(savedOrder[i]) < 0) order.push(savedOrder[i])
+    savedOrder = order
+    stateFile.setText(JSON.stringify({ order: order }, null, 2) + "\n")
+  }
+
+  function loadState(text) {
+    try {
+      var state = JSON.parse(String(text || "{}"))
+      savedOrder = Array.isArray(state.order) ? state.order : []
+    } catch (error) {
+      savedOrder = []
+    }
   }
 
   // Mirrors OMP's resolveUsedFraction: explicit fraction > used/limit >
@@ -339,10 +392,42 @@ Panel {
     slowBackoffMs = backoff
   }
 
-  Component.onCompleted: refresh()
+  // Insertion index (0..count) for a drag at `y` in column coordinates.
+  function dropIndexAt(y) {
+    for (var i = 0; i < sectionRepeater.count; i++) {
+      var item = sectionRepeater.itemAt(i)
+      if (item && y < item.y + item.height / 2) return i
+    }
+    return sectionRepeater.count
+  }
+
+  function dropLineY(index) {
+    var count = sectionRepeater.count
+    if (index < 0 || count === 0) return 0
+    if (index < count) {
+      var item = sectionRepeater.itemAt(index)
+      return item ? item.y - column.spacing / 2 : 0
+    }
+    var last = sectionRepeater.itemAt(count - 1)
+    return last ? last.y + last.height + column.spacing / 2 : 0
+  }
+
+  // Plans change rarely: look them up at start, then at most hourly on open.
+  property double plansFetchedAt: 0
+  function refreshPlans() {
+    if (planProcess.running) return
+    plansFetchedAt = Date.now()
+    planProcess.running = true
+  }
+
+  Component.onCompleted: {
+    refresh()
+    refreshPlans()
+  }
   onOpenedChanged: if (opened) {
     nowMs = Date.now()
     refresh()
+    if (nowMs - plansFetchedAt > 3600000) refreshPlans()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -377,6 +462,36 @@ Panel {
       waitForEnd: true
       onStreamFinished: if (text.trim() !== "") console.warn("omp-usage", text.trim())
     }
+  }
+
+  Process {
+    id: planProcess
+    command: ["python3", Qt.resolvedUrl("plans.py").toString().replace(/^file:\/\//, "")]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(String(text || "{}"))
+          if (parsed && typeof parsed === "object") root.plans = parsed
+        } catch (error) {
+          console.warn("omp-usage plans", error)
+        }
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim() !== "") console.warn("omp-usage plans", text.trim())
+    }
+  }
+
+  FileView {
+    id: stateFile
+    path: root.statePath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadState(text())
+    onLoadFailed: root.loadState("{}")
   }
 
   IpcHandler {
@@ -434,6 +549,18 @@ Panel {
         interactive: contentHeight > height
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
+        // Where a dragged account will land.
+        Rectangle {
+          z: 2
+          visible: root.dragKey !== "" && root.dropIndex >= 0
+          x: 0
+          width: panelFlick.width
+          height: Math.max(2, Style.space(2))
+          radius: height / 2
+          color: Color.accent
+          y: root.dropLineY(root.dropIndex) - height / 2
+        }
+
         Column {
           id: column
           width: panelFlick.width
@@ -457,6 +584,7 @@ Panel {
           }
 
           Repeater {
+            id: sectionRepeater
             model: root.displayReports
             ProviderSection {
               // Index into the JS array: modelData would be converted to a
@@ -489,7 +617,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Live · updates every 3s · Esc close"
+            text: "Updates every 3s · drag a name to reorder"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -503,6 +631,8 @@ Panel {
   component ProviderSection: Column {
     id: section
     property var report: null
+    readonly property string key: report ? root.reportKey(report) : ""
+    opacity: root.dragKey !== "" && root.dragKey === key ? 0.4 : 1
     readonly property string iconSource: report ? root.providerIcon(report.provider) : ""
     readonly property int resetCount: report && report.resetCredits ? Number(report.resetCredits.availableCount) || 0 : 0
     spacing: Style.space(10)
@@ -512,6 +642,32 @@ Panel {
     Item {
       width: parent.width
       implicitHeight: Math.max(name.implicitHeight, icon.height)
+
+      // Press and drag the header to move this account up or down.
+      MouseArea {
+        anchors.fill: parent
+        z: 1
+        preventStealing: true
+        cursorShape: root.dragKey === section.key ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+        onPressed: function(mouse) {
+          root.dragKey = section.key
+          root.dropIndex = -1
+        }
+        onPositionChanged: function(mouse) {
+          if (root.dragKey !== section.key) return
+          root.dropIndex = root.dropIndexAt(mapToItem(column, mouse.x, mouse.y).y)
+        }
+        onReleased: function(mouse) {
+          if (root.dropIndex >= 0) root.moveReport(section.key, root.dropIndex)
+          root.dragKey = ""
+          root.dropIndex = -1
+        }
+        onCanceled: {
+          root.dragKey = ""
+          root.dropIndex = -1
+        }
+      }
+
       Item {
         id: icon
         anchors.left: parent.left
@@ -553,7 +709,7 @@ Panel {
         anchors.leftMargin: Style.spacing.sm
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
-        text: root.accountText(section.report)
+        text: root.planText(section.report)
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
