@@ -85,6 +85,60 @@ Panel {
     return false
   }
 
+  // Worst (highest) used fraction across an account's live limits, or
+  // undefined when it has no limit a meter can be drawn from.
+  function worstUsed(report) {
+    if (!report || report.noUsage) return undefined
+    var worst
+    var limits = report.limits || []
+    for (var i = 0; i < limits.length; i++) {
+      if (windowExpired(limits[i])) continue
+      var used = usedFraction(limits[i])
+      if (used === undefined || isNaN(used)) continue
+      worst = worst === undefined ? used : Math.max(worst, used)
+    }
+    return worst
+  }
+
+  // Bar icon meters: first two accounts (in the panel's order) that report
+  // usage. Each is { name, used, level 0..4, alarming }.
+  readonly property var meters: {
+    var list = []
+    for (var i = 0; i < displayReports.length && list.length < 2; i++) {
+      var used = worstUsed(displayReports[i])
+      if (used === undefined) continue
+      var left = Math.max(0, 1 - used)
+      list.push({
+        name: providerName(displayReports[i].provider),
+        used: used,
+        level: Math.max(0, Math.min(4, Math.ceil(left * 4 - 1e-9))),
+        alarming: used >= 0.9
+      })
+    }
+    return list
+  }
+
+  // An account beyond the two shown meters is running low.
+  readonly property bool hiddenAlarm: {
+    var shown = 0
+    for (var i = 0; i < displayReports.length; i++) {
+      var used = worstUsed(displayReports[i])
+      if (used === undefined) continue
+      if (shown++ >= 2 && used >= 0.9) return true
+    }
+    return false
+  }
+
+  readonly property string meterTooltip: {
+    var parts = []
+    for (var i = 0; i < displayReports.length; i++) {
+      var used = worstUsed(displayReports[i])
+      if (used !== undefined)
+        parts.push(providerName(displayReports[i].provider) + " " + Math.round(Math.max(0, 1 - used) * 100) + "% left")
+    }
+    return parts.length > 0 ? parts.join(" · ") : "OMP Usage"
+  }
+
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -541,12 +595,56 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // The stock Agents widget uses a glyph through BarIconButton. π is the
-    // Oh My Pi mark here, avoiding a theme-dependent raster asset.
-    text: "π"
+    // Dual-SIM style signal: top row bars = first account, bottom row dots =
+    // second account; more lit = more usage left. π when nothing reports usage.
+    text: root.meters.length === 0 ? "π" : ""
+    iconComponent: root.meters.length === 0 ? null : signalIcon
+    // 17px canvas centers on whole pixels in the 27px slot, keeping bars crisp.
+    opticalSize: 17
     active: root.alarming
-    tooltipText: "OMP Usage"
+    tooltipText: root.meterTooltip
     onPressed: function(buttonCode) { root.toggle() }
+  }
+
+  Component {
+    id: signalIcon
+    Item {
+      id: signal
+      readonly property color lit: button.foreground
+      readonly property color dimmed: Qt.rgba(lit.r, lit.g, lit.b, 0.28)
+      readonly property var primary: root.meters.length > 0 ? root.meters[0] : null
+      readonly property var secondary: root.meters.length > 1 ? root.meters[1] : null
+      readonly property color primaryColor: primary && (primary.alarming || root.hiddenAlarm) ? button.activeColor : lit
+      readonly property color secondaryColor: secondary && (secondary.alarming || root.hiddenAlarm) ? button.activeColor : lit
+
+      // Bars: 3px wide, 1px apart, 3/5/7/9px tall on a shared baseline.
+      // Alone they sit centered; with a second account they share the canvas.
+      Repeater {
+        model: 4
+        Rectangle {
+          required property int index
+          x: 1 + index * 4
+          width: 3
+          height: 3 + index * 2
+          y: (signal.secondary ? 10 : 13) - height
+          antialiasing: false
+          color: signal.primary && index < signal.primary.level ? signal.primaryColor : signal.dimmed
+        }
+      }
+
+      Repeater {
+        model: signal.secondary ? 4 : 0
+        Rectangle {
+          required property int index
+          x: 1 + index * 4
+          y: 13
+          width: 3
+          height: 3
+          antialiasing: false
+          color: index < signal.secondary.level ? signal.secondaryColor : signal.dimmed
+        }
+      }
+    }
   }
 
   KeyboardPanel {
