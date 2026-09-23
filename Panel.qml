@@ -27,7 +27,7 @@ Panel {
   readonly property bool alarming: {
     if (!provider || !provider.limits) return false
     for (var i = 0; i < provider.limits.length; i++)
-      if (Number(provider.limits[i].amount && provider.limits[i].amount.usedFraction) >= 0.9) return true
+      if (!windowExpired(provider.limits[i]) && Number(provider.limits[i].amount && provider.limits[i].amount.usedFraction) >= 0.9) return true
     return false
   }
 
@@ -74,8 +74,28 @@ Panel {
   }
 
   function resetText(limit) {
+    if (windowExpired(limit)) return "Window reset · waiting for fresh data"
     var resetAt = Number(limit && limit.window && limit.window.resetsAt)
     return resetAt > 0 ? "Resets in " + formatDuration(resetAt - nowMs) : ""
+  }
+
+  // OMP falls back to its last cached report (however old) when a provider
+  // rate-limits the usage endpoint. A window whose reset has passed carries no
+  // valid usage figure.
+  function windowExpired(limit) {
+    var resetAt = Number(limit && limit.window && limit.window.resetsAt)
+    return resetAt > 0 && resetAt <= nowMs
+  }
+
+  function reportKey(report) {
+    var metadata = report && report.metadata ? report.metadata : {}
+    return String(report && report.provider) + "|" + String(metadata.accountId || metadata.email || "")
+  }
+
+  function staleText(report) {
+    var fetchedAt = Number(report && report.fetchedAt)
+    if (!(fetchedAt > 0) || nowMs - fetchedAt < root.refreshIntervalSec * 2000) return ""
+    return "Provider unreachable · last update " + formatDuration(nowMs - fetchedAt) + " ago"
   }
 
   function limitTitle(limit) {
@@ -86,16 +106,27 @@ Panel {
   }
 
   function parseUsage(text) {
+    var parsed
     try {
-      var parsed = JSON.parse(String(text || ""))
-      reports = Array.isArray(parsed.reports) ? parsed.reports : []
-      if (selectedIndex >= reports.length) selectedIndex = 0
-      errorText = ""
+      parsed = JSON.parse(String(text || ""))
     } catch (error) {
-      reports = []
       errorText = "Could not read OMP usage data"
       console.warn("omp-usage", error)
+      return
     }
+    var incoming = Array.isArray(parsed.reports) ? parsed.reports : []
+    // Never replace a newer report with an older cached one.
+    var previous = {}
+    for (var i = 0; i < reports.length; i++) previous[reportKey(reports[i])] = reports[i]
+    var merged = []
+    for (var j = 0; j < incoming.length; j++) {
+      var known = previous[reportKey(incoming[j])]
+      merged.push(known && Number(known.fetchedAt) > Number(incoming[j].fetchedAt) ? known : incoming[j])
+    }
+    reports = merged
+    nowMs = Date.now()
+    if (selectedIndex >= reports.length) selectedIndex = 0
+    errorText = ""
   }
 
   Component.onCompleted: refresh()
@@ -261,13 +292,23 @@ Panel {
           }
 
           Text {
-            visible: root.provider && root.provider.resetCredits && Number(root.provider.resetCredits.availableCount) > 0
+            visible: !!(root.provider && root.provider.resetCredits) && Number(root.provider.resetCredits.availableCount) > 0
             width: parent.width
             text: Number(root.provider && root.provider.resetCredits && root.provider.resetCredits.availableCount)
               + " saved reset" + (Number(root.provider && root.provider.resetCredits && root.provider.resetCredits.availableCount) === 1 ? "" : "s")
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            visible: text !== ""
+            width: parent.width
+            text: root.staleText(root.provider)
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           Text {
@@ -296,7 +337,8 @@ Panel {
   component LimitRow: Column {
     id: limitRow
     property var limit: null
-    readonly property real fraction: Math.max(0, Math.min(1, Number(limit && limit.amount && limit.amount.usedFraction || 0)))
+    readonly property bool expired: root.windowExpired(limit)
+    readonly property real fraction: expired ? 0 : Math.max(0, Math.min(1, Number(limit && limit.amount && limit.amount.usedFraction || 0)))
     readonly property bool alarming: fraction >= 0.9
     spacing: Style.space(6)
 
@@ -319,7 +361,7 @@ Panel {
         id: value
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
-        text: Math.round(limitRow.fraction * 100) + "%"
+        text: limitRow.expired ? "—" : Math.round(limitRow.fraction * 100) + "%"
         color: limitRow.alarming ? root.urgent : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
