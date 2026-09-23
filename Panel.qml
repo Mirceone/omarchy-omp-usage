@@ -19,15 +19,15 @@ Panel {
   readonly property int refreshIntervalSec: Math.max(30, Number(settings && settings.refreshIntervalSec || 300))
 
   property var reports: []
-  property int selectedIndex: 0
   property string errorText: ""
   property double nowMs: Date.now()
 
-  readonly property var provider: reports.length > 0 ? reports[selectedIndex] : null
   readonly property bool alarming: {
-    if (!provider || !provider.limits) return false
-    for (var i = 0; i < provider.limits.length; i++)
-      if (!windowExpired(provider.limits[i]) && Number(usedFraction(provider.limits[i])) >= 0.9) return true
+    for (var r = 0; r < reports.length; r++) {
+      var limits = reports[r].limits || []
+      for (var i = 0; i < limits.length; i++)
+        if (!windowExpired(limits[i]) && Number(usedFraction(limits[i])) >= 0.9) return true
+    }
     return false
   }
 
@@ -59,11 +59,6 @@ Panel {
     if (plan) return plan[0].toUpperCase() + plan.slice(1) + " plan"
     if (String(metadata.endpoint || "").indexOf("/oauth/") >= 0) return "Subscription"
     return String(metadata.email || "")
-  }
-
-  function heroMeta(report) {
-    var detail = accountText(report)
-    return detail ? "Oh My Pi · " + detail : "Oh My Pi"
   }
 
   // Mirrors OMP's resolveUsedFraction: explicit fraction > used/limit >
@@ -106,12 +101,6 @@ Panel {
 
   function refresh() {
     if (!usageProcess.running) usageProcess.running = true
-  }
-
-  function selectProvider(index) {
-    if (reports.length === 0) return
-    selectedIndex = ((index % reports.length) + reports.length) % reports.length
-    panelFlick.contentY = 0
   }
 
   function formatDuration(ms) {
@@ -189,7 +178,6 @@ Panel {
     }
     reports = merged
     nowMs = Date.now()
-    if (selectedIndex >= reports.length) selectedIndex = 0
     errorText = ""
   }
 
@@ -200,18 +188,24 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
+  // Closed: keep the bar icon's alarm state current at the configured pace.
   Timer {
     interval: root.refreshIntervalSec * 1000
-    running: true
+    running: !root.opened
     repeat: true
     onTriggered: root.refresh()
   }
 
+  // Open: live view. Each tick is a real provider request (OMP does not
+  // cache between calls); refresh() skips a tick while one is in flight.
   Timer {
-    interval: 30000
+    interval: 3000
     running: root.opened
     repeat: true
-    onTriggered: root.nowMs = Date.now()
+    onTriggered: {
+      root.nowMs = Date.now()
+      root.refresh()
+    }
   }
 
   Process {
@@ -233,7 +227,6 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refresh(); return "ok" }
-    function next(): string { root.selectProvider(root.selectedIndex + 1); return "ok" }
   }
 
   BarIconButton {
@@ -244,11 +237,8 @@ Panel {
     // Oh My Pi mark here, avoiding a theme-dependent raster asset.
     text: "π"
     active: root.alarming
-    tooltipText: root.provider ? "OMP Usage · " + root.providerName(root.provider.provider) : "OMP Usage"
-    onPressed: function(buttonCode) {
-      if (buttonCode === Qt.MiddleButton) root.selectProvider(root.selectedIndex + 1)
-      else root.toggle()
-    }
+    tooltipText: "OMP Usage"
+    onPressed: function(buttonCode) { root.toggle() }
   }
 
   KeyboardPanel {
@@ -259,13 +249,12 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(520))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(640))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
-        if (dx !== 0) root.selectProvider(root.selectedIndex + dx)
         if (dy !== 0) panelFlick.contentY = Math.max(0, Math.min(panelFlick.contentHeight - panelFlick.height,
           panelFlick.contentY + dy * Style.space(56)))
       }
@@ -274,8 +263,6 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
         if (text === "r" || text === "R") root.refresh()
-        if (text === "h" || text === "H") root.selectProvider(root.selectedIndex - 1)
-        if (text === "l" || text === "L") root.selectProvider(root.selectedIndex + 1)
       }
 
       Flickable {
@@ -296,111 +283,37 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: root.provider ? root.providerName(root.provider.provider) : "OMP Usage"
-            meta: root.heroMeta(root.provider)
+            title: "OMP Usage"
+            meta: root.reports.length === 1 ? "Oh My Pi · 1 account" : "Oh My Pi · " + root.reports.length + " accounts"
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
-              Item {
-                readonly property string iconSource: root.provider ? root.providerIcon(root.provider.provider) : ""
-                width: Style.font.display
-                height: Style.font.display
-                Image {
-                  anchors.fill: parent
-                  visible: parent.iconSource !== ""
-                  source: parent.iconSource
-                  sourceSize.width: Style.font.display * 2
-                  sourceSize.height: Style.font.display * 2
-                  fillMode: Image.PreserveAspectFit
-                }
-                // Providers without a bundled logo get their initial instead.
-                Text {
-                  anchors.centerIn: parent
-                  visible: parent.iconSource === ""
-                  text: root.provider ? root.providerName(root.provider.provider).charAt(0) : "π"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.display
-                  font.bold: true
-                }
+              Text {
+                text: "π"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.display
+                font.bold: true
               }
             }
           }
 
-          Row {
-            visible: root.reports.length > 1
-            width: parent.width
-            spacing: Style.spacing.md
-            Repeater {
-              model: root.reports
-              Button {
-                required property var modelData
-                required property int index
-                width: (parent.width - parent.spacing * (root.reports.length - 1)) / root.reports.length
-                text: root.providerName(modelData.provider)
-                selected: index === root.selectedIndex
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                verticalPadding: Style.spacing.controlPaddingY
-                onClicked: root.selectProvider(index)
-              }
-            }
-          }
-
-          PanelSeparator { width: parent.width; foreground: root.foreground }
-
-          Column {
-            visible: limitRepeater.count > 0
-            width: parent.width
-            spacing: Style.space(10)
-            PanelSectionHeader {
+          Repeater {
+            model: root.reports
+            ProviderSection {
+              // Index into the JS array: modelData would be converted to a
+              // QVariantMap whose nested lists fail Array.isArray.
+              required property int index
               width: parent.width
-              text: "LIMITS"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-            Repeater {
-              id: limitRepeater
-              model: root.provider && Array.isArray(root.provider.limits) ? root.provider.limits : []
-              LimitRow {
-                required property var modelData
-                width: parent.width
-                limit: modelData
-              }
+              report: root.reports[index]
             }
           }
 
           Text {
-            visible: text !== ""
+            visible: root.reports.length === 0 && root.errorText === ""
             width: parent.width
-            text: root.errorText !== "" ? ""
-              : !root.provider ? "No accounts logged in to Oh My Pi. Run omp and use /login."
-              : root.provider.noUsage ? "Logged in, but " + root.providerName(root.provider.provider)
-                + " doesn't report usage to Oh My Pi."
-              : ""
+            text: "No accounts logged in to Oh My Pi. Run omp and use /login."
             color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-          }
-
-          Text {
-            visible: !!(root.provider && root.provider.resetCredits) && Number(root.provider.resetCredits.availableCount) > 0
-            width: parent.width
-            text: Number(root.provider && root.provider.resetCredits && root.provider.resetCredits.availableCount)
-              + " saved reset" + (Number(root.provider && root.provider.resetCredits && root.provider.resetCredits.availableCount) === 1 ? "" : "s")
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Text {
-            visible: text !== ""
-            width: parent.width
-            text: root.staleText(root.provider)
-            color: root.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
@@ -418,7 +331,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "r refresh" + (root.reports.length > 1 ? " · h/l switch account" : "") + " · Esc close"
+            text: "Live · updates every 3s · Esc close"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -426,6 +339,107 @@ Panel {
           }
         }
       }
+    }
+  }
+
+  component ProviderSection: Column {
+    id: section
+    property var report: null
+    readonly property string iconSource: report ? root.providerIcon(report.provider) : ""
+    readonly property int resetCount: report && report.resetCredits ? Number(report.resetCredits.availableCount) || 0 : 0
+    spacing: Style.space(10)
+
+    PanelSeparator { width: parent.width; foreground: root.foreground }
+
+    Item {
+      width: parent.width
+      implicitHeight: Math.max(name.implicitHeight, icon.height)
+      Item {
+        id: icon
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.font.body * 1.25
+        height: width
+        Image {
+          anchors.fill: parent
+          visible: section.iconSource !== ""
+          source: section.iconSource
+          sourceSize.width: parent.width * 2
+          sourceSize.height: parent.height * 2
+          fillMode: Image.PreserveAspectFit
+        }
+        // Providers without a bundled logo get their initial instead.
+        Text {
+          anchors.centerIn: parent
+          visible: section.iconSource === ""
+          text: section.report ? root.providerName(section.report.provider).charAt(0) : ""
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+        }
+      }
+      Text {
+        id: name
+        anchors.left: icon.right
+        anchors.leftMargin: Style.spacing.sm
+        anchors.verticalCenter: parent.verticalCenter
+        text: section.report ? root.providerName(section.report.provider) : ""
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+      }
+      Text {
+        anchors.left: name.right
+        anchors.leftMargin: Style.spacing.sm
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.accountText(section.report)
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        horizontalAlignment: Text.AlignRight
+        elide: Text.ElideLeft
+      }
+    }
+
+    Repeater {
+      model: section.report && Array.isArray(section.report.limits) ? section.report.limits : []
+      LimitRow {
+        required property var modelData
+        width: section.width
+        limit: modelData
+      }
+    }
+
+    Text {
+      visible: !!(section.report && section.report.noUsage)
+      width: parent.width
+      text: section.report ? "Logged in, but " + root.providerName(section.report.provider) + " doesn't report usage to Oh My Pi." : ""
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+
+    Text {
+      visible: section.resetCount > 0
+      width: parent.width
+      text: section.resetCount + " saved reset" + (section.resetCount === 1 ? "" : "s")
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      visible: text !== ""
+      width: parent.width
+      text: root.staleText(section.report)
+      color: root.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
     }
   }
 
