@@ -27,30 +27,81 @@ Panel {
   readonly property bool alarming: {
     if (!provider || !provider.limits) return false
     for (var i = 0; i < provider.limits.length; i++)
-      if (!windowExpired(provider.limits[i]) && Number(provider.limits[i].amount && provider.limits[i].amount.usedFraction) >= 0.9) return true
+      if (!windowExpired(provider.limits[i]) && Number(usedFraction(provider.limits[i])) >= 0.9) return true
     return false
   }
 
-  visible: reports.length > 0
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
   function providerName(id) {
-    if (id === "openai-codex") return "Codex"
-    if (id === "anthropic") return "Claude"
-    return String(id || "Unknown provider")
+    var names = { "openai-codex": "Codex", "anthropic": "Claude", "cursor": "Cursor" }
+    if (names[id]) return names[id]
+    // Same title-casing OMP itself uses for provider ids ("github-copilot" -> "Github Copilot").
+    return String(id || "Unknown provider").split(/[-_]/).map(function(part) {
+      return part ? part[0].toUpperCase() + part.slice(1) : ""
+    }).join(" ")
   }
 
   function providerIcon(id) {
     if (id === "openai-codex") return Qt.resolvedUrl("assets/codex.svg")
     if (id === "anthropic") return Qt.resolvedUrl("assets/claude.svg")
+    if (id === "cursor") return Qt.resolvedUrl("assets/cursor.svg")
     return ""
   }
 
-  function accessType(report) {
-    var metadata = report && report.metadata ? report.metadata : {}
-    if (metadata.planType || String(metadata.endpoint || "").indexOf("/oauth/") >= 0) return "Subscription"
-    return "API"
+  // Only states what the report actually proves; never guesses "API".
+  function accountText(report) {
+    if (!report) return ""
+    if (report.noUsage) return report.credentialType === "api_key" ? "API key" : "Subscription"
+    var metadata = report.metadata || {}
+    var plan = String(metadata.planType || "")
+    if (plan) return plan[0].toUpperCase() + plan.slice(1) + " plan"
+    if (String(metadata.endpoint || "").indexOf("/oauth/") >= 0) return "Subscription"
+    return String(metadata.email || "")
+  }
+
+  function heroMeta(report) {
+    var detail = accountText(report)
+    return detail ? "Oh My Pi · " + detail : "Oh My Pi"
+  }
+
+  // Mirrors OMP's resolveUsedFraction: explicit fraction > used/limit >
+  // percent-unit used > inverted remaining. undefined = no quota to draw.
+  function usedFraction(limit) {
+    var amount = limit && limit.amount ? limit.amount : {}
+    if (amount.usedFraction !== undefined) return Number(amount.usedFraction)
+    if (amount.used !== undefined && Number(amount.limit) > 0) return amount.used / amount.limit
+    if (amount.unit === "percent" && amount.used !== undefined) return amount.used / 100
+    if (amount.remainingFraction !== undefined) return Math.max(0, 1 - amount.remainingFraction)
+    return undefined
+  }
+
+  function formatQuantity(value, unit) {
+    if (unit === "usd") return "$" + Number(value).toFixed(2)
+    var formatted = Number(value).toLocaleString(Qt.locale("en_US"), "f", Number(value) % 1 === 0 ? 0 : 1)
+    return unit && unit !== "unknown" ? formatted + " " + unit : formatted
+  }
+
+  // Absolute figures: "$8.40 of $20.00" beside a bar, or the whole reading
+  // ("$12.34 used", "$5.00 left") when there is no allowance to draw a bar from.
+  function amountText(limit) {
+    var amount = limit && limit.amount ? limit.amount : {}
+    if (amount.unit === "percent") return ""
+    if (amount.used !== undefined && Number(amount.limit) > 0)
+      return formatQuantity(amount.used, amount.unit) + " of " + formatQuantity(amount.limit, amount.unit)
+    if (amount.used !== undefined) return formatQuantity(amount.used, amount.unit) + " used"
+    if (amount.remaining !== undefined) return formatQuantity(amount.remaining, amount.unit) + " left"
+    return ""
+  }
+
+  function detailText(limit, hasBar) {
+    var parts = []
+    var amount = hasBar ? amountText(limit) : ""
+    if (amount && !windowExpired(limit)) parts.push(amount)
+    var reset = resetText(limit)
+    if (reset) parts.push(reset)
+    return parts.join(" · ")
   }
 
   function refresh() {
@@ -92,6 +143,17 @@ Panel {
     return String(report && report.provider) + "|" + String(metadata.accountId || metadata.email || "")
   }
 
+  // Logged-in accounts OMP has no usage endpoint (or no data) for.
+  function accountWithoutUsage(account) {
+    return {
+      provider: account.provider,
+      noUsage: true,
+      credentialType: account.type,
+      metadata: { email: account.email, accountId: account.accountId },
+      limits: []
+    }
+  }
+
   function staleText(report) {
     var fetchedAt = Number(report && report.fetchedAt)
     if (!(fetchedAt > 0) || nowMs - fetchedAt < root.refreshIntervalSec * 2000) return ""
@@ -114,14 +176,16 @@ Panel {
       console.warn("omp-usage", error)
       return
     }
-    var incoming = Array.isArray(parsed.reports) ? parsed.reports : []
+    var incoming = Array.isArray(parsed.reports) ? parsed.reports.slice() : []
+    var unreported = Array.isArray(parsed.accountsWithoutUsage) ? parsed.accountsWithoutUsage : []
+    for (var k = 0; k < unreported.length; k++) incoming.push(accountWithoutUsage(unreported[k]))
     // Never replace a newer report with an older cached one.
     var previous = {}
     for (var i = 0; i < reports.length; i++) previous[reportKey(reports[i])] = reports[i]
     var merged = []
     for (var j = 0; j < incoming.length; j++) {
       var known = previous[reportKey(incoming[j])]
-      merged.push(known && Number(known.fetchedAt) > Number(incoming[j].fetchedAt) ? known : incoming[j])
+      merged.push(known && !known.noUsage && Number(known.fetchedAt) > Number(incoming[j].fetchedAt) ? known : incoming[j])
     }
     reports = merged
     nowMs = Date.now()
@@ -233,17 +297,32 @@ Panel {
           PanelHero {
             width: parent.width
             title: root.provider ? root.providerName(root.provider.provider) : "OMP Usage"
-            meta: root.provider ? "Oh My Pi · " + root.accessType(root.provider) : "Oh My Pi"
+            meta: root.heroMeta(root.provider)
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
-              Image {
-                source: root.provider ? root.providerIcon(root.provider.provider) : ""
-                sourceSize.width: Style.font.display * 2
-                sourceSize.height: Style.font.display * 2
+              Item {
+                readonly property string iconSource: root.provider ? root.providerIcon(root.provider.provider) : ""
                 width: Style.font.display
                 height: Style.font.display
-                fillMode: Image.PreserveAspectFit
+                Image {
+                  anchors.fill: parent
+                  visible: parent.iconSource !== ""
+                  source: parent.iconSource
+                  sourceSize.width: Style.font.display * 2
+                  sourceSize.height: Style.font.display * 2
+                  fillMode: Image.PreserveAspectFit
+                }
+                // Providers without a bundled logo get their initial instead.
+                Text {
+                  anchors.centerIn: parent
+                  visible: parent.iconSource === ""
+                  text: root.provider ? root.providerName(root.provider.provider).charAt(0) : "π"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.display
+                  font.bold: true
+                }
               }
             }
           }
@@ -273,6 +352,7 @@ Panel {
           PanelSeparator { width: parent.width; foreground: root.foreground }
 
           Column {
+            visible: limitRepeater.count > 0
             width: parent.width
             spacing: Style.space(10)
             PanelSectionHeader {
@@ -282,6 +362,7 @@ Panel {
               fontFamily: root.fontFamily
             }
             Repeater {
+              id: limitRepeater
               model: root.provider && Array.isArray(root.provider.limits) ? root.provider.limits : []
               LimitRow {
                 required property var modelData
@@ -289,6 +370,20 @@ Panel {
                 limit: modelData
               }
             }
+          }
+
+          Text {
+            visible: text !== ""
+            width: parent.width
+            text: root.errorText !== "" ? ""
+              : !root.provider ? "No accounts logged in to Oh My Pi. Run omp and use /login."
+              : root.provider.noUsage ? "Logged in, but " + root.providerName(root.provider.provider)
+                + " doesn't report usage to Oh My Pi."
+              : ""
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           Text {
@@ -323,7 +418,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "r refresh · h/l switch subscription · Esc close"
+            text: "r refresh" + (root.reports.length > 1 ? " · h/l switch account" : "") + " · Esc close"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -338,7 +433,9 @@ Panel {
     id: limitRow
     property var limit: null
     readonly property bool expired: root.windowExpired(limit)
-    readonly property real fraction: expired ? 0 : Math.max(0, Math.min(1, Number(limit && limit.amount && limit.amount.usedFraction || 0)))
+    readonly property var rawFraction: root.usedFraction(limit)
+    readonly property bool hasBar: rawFraction !== undefined && !isNaN(rawFraction)
+    readonly property real fraction: expired || !hasBar ? 0 : Math.max(0, Math.min(1, rawFraction))
     readonly property bool alarming: fraction >= 0.9
     spacing: Style.space(6)
 
@@ -361,7 +458,7 @@ Panel {
         id: value
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
-        text: limitRow.expired ? "—" : Math.round(limitRow.fraction * 100) + "%"
+        text: limitRow.expired ? "—" : limitRow.hasBar ? Math.round(limitRow.fraction * 100) + "%" : root.amountText(limitRow.limit)
         color: limitRow.alarming ? root.urgent : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -369,6 +466,7 @@ Panel {
     }
 
     Rectangle {
+      visible: limitRow.hasBar
       width: parent.width
       height: Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
       radius: height / 2
@@ -382,8 +480,9 @@ Panel {
     }
 
     Text {
+      visible: text !== ""
       width: parent.width
-      text: root.resetText(limitRow.limit)
+      text: root.detailText(limitRow.limit, limitRow.hasBar)
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
