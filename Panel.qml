@@ -22,9 +22,18 @@ Panel {
   property string errorText: ""
   property double nowMs: Date.now()
 
+  property var history: ({})
+  property var knownProviders: []
+  property double lastFullAt: 0
+  property var pending: null
+  property var slowNextAt: ({})
+  property var slowBackoffMs: ({})
+
+  readonly property var displayReports: reports.map(withHistory)
+
   readonly property bool alarming: {
-    for (var r = 0; r < reports.length; r++) {
-      var limits = reports[r].limits || []
+    for (var r = 0; r < displayReports.length; r++) {
+      var limits = displayReports[r].limits || []
       for (var i = 0; i < limits.length; i++)
         if (!windowExpired(limits[i]) && Number(usedFraction(limits[i])) >= 0.9) return true
     }
@@ -99,9 +108,43 @@ Panel {
     return parts.join(" · ")
   }
 
+  // Providers whose usage endpoint is throttled hard (Anthropic limits
+  // /api/oauth/usage per IP). They are polled live at most once a minute,
+  // backing off while they answer with a rate limit; OMP's own recorded
+  // usage (from normal model responses) fills the gap.
+  readonly property var slowProviders: ({ "anthropic": true })
+  readonly property int slowIntervalMs: 60000
+  readonly property int slowMaxBackoffMs: 15 * 60000
+  // Full `omp usage --json` pass: discovers accounts (including ones
+  // without usage) and doubles as a slow-provider poll.
+  readonly property int discoveryIntervalMs: 15 * 60000
+
   function refresh() {
-    if (!usageProcess.running) usageProcess.running = true
+    if (usageProcess.running) return
+    var now = Date.now()
+    var allSlowDue = true
+    var providers = []
+    for (var i = 0; i < knownProviders.length; i++) {
+      var id = knownProviders[i]
+      if (!slowProviders[id]) providers.push(id)
+      else if (now >= Number(slowNextAt[id] || 0)) providers.push(id)
+      else allSlowDue = false
+    }
+    // Rediscover periodically, but never while a slow provider is backing off.
+    var full = lastFullAt === 0 || (allSlowDue && now - lastFullAt >= discoveryIntervalMs)
+    pending = { full: full, providers: full ? knownProviders.slice() : providers, startedAt: now }
+    usageProcess.command = ["bash", "-c", batchScript, "omp-usage"].concat(full ? ["--all"] : providers)
+    usageProcess.running = true
   }
+
+  // Runs the requested OMP calls in parallel plus the local history read,
+  // emitting each JSON document followed by an ASCII record separator.
+  readonly property string batchScript: "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT\n"
+    + "if [ \"$1\" = --all ]; then omp usage --json > \"$tmp/0\" &\n"
+    + "else i=0; for p in \"$@\"; do i=$((i+1)); omp usage --json --provider \"$p\" > \"$tmp/$i\" & done; fi\n"
+    + "omp usage --history --json --days 1 > \"$tmp/h\" &\n"
+    + "wait\n"
+    + "for f in \"$tmp\"/*; do cat \"$f\"; printf '\\036'; done\n"
 
   function formatDuration(ms) {
     if (!(ms > 0)) return "now"
@@ -143,10 +186,63 @@ Panel {
     }
   }
 
+  // Latest recorded snapshot per account limit from `omp usage --history`.
+  function indexHistory(entries) {
+    var latest = {}
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i]
+      var key = e.provider + "|" + (e.accountId || e.email || "") + "|" + e.limitId
+      if (!latest[key] || latest[key].recordedAt < e.recordedAt) latest[key] = e
+    }
+    return latest
+  }
+
+  // Replace limits in a report that OMP has recorded more recently than the
+  // report itself was fetched (e.g. a rate-limited provider's cached report).
+  function withHistory(report) {
+    if (!report || report.noUsage || !Array.isArray(report.limits)) return report
+    var fetchedAt = Number(report.fetchedAt) || 0
+    var asOf = fetchedAt
+    var prefix = reportKey(report) + "|"
+    var limits = []
+    for (var i = 0; i < report.limits.length; i++) {
+      var limit = report.limits[i]
+      var h = history[prefix + limit.id]
+      if (!h || !(h.recordedAt > fetchedAt) || h.usedFraction === undefined || h.usedFraction === null) {
+        limits.push(limit)
+        continue
+      }
+      var amount = Object.assign({}, limit.amount, {
+        usedFraction: h.usedFraction,
+        remainingFraction: Math.max(0, 1 - h.usedFraction)
+      })
+      if (Number(amount.limit) > 0) {
+        amount.used = amount.limit * h.usedFraction
+        amount.remaining = Math.max(0, amount.limit - amount.used)
+      } else if (amount.unit === "percent") {
+        amount.used = h.usedFraction * 100
+      }
+      var windowInfo = Object.assign({}, limit.window)
+      if (h.resetsAt) windowInfo.resetsAt = h.resetsAt
+      else delete windowInfo.resetsAt
+      limits.push(Object.assign({}, limit, { amount: amount, window: windowInfo }))
+      asOf = Math.max(asOf, h.recordedAt)
+    }
+    return Object.assign({}, report, { limits: limits, asOf: asOf })
+  }
+
   function staleText(report) {
-    var fetchedAt = Number(report && report.fetchedAt)
-    if (!(fetchedAt > 0) || nowMs - fetchedAt < root.refreshIntervalSec * 2000) return ""
-    return "Provider unreachable · last update " + formatDuration(nowMs - fetchedAt) + " ago"
+    var at = Number(report && (report.asOf || report.fetchedAt))
+    if (!(at > 0)) return ""
+    var age = nowMs - at
+    if (age >= 2 * 3600000) return "Provider unreachable · last update " + formatDuration(age) + " ago"
+    if (age >= 90000) return "Updated " + formatDuration(age) + " ago"
+    return ""
+  }
+
+  function staleUrgent(report) {
+    var at = Number(report && (report.asOf || report.fetchedAt))
+    return at > 0 && nowMs - at >= 2 * 3600000
   }
 
   function limitTitle(limit) {
@@ -156,29 +252,91 @@ Panel {
     return title
   }
 
-  function parseUsage(text) {
-    var parsed
-    try {
-      parsed = JSON.parse(String(text || ""))
-    } catch (error) {
+  function parseBatch(text) {
+    var request = pending || { full: true, providers: [], startedAt: Date.now() }
+    pending = null
+    var docs = String(text || "").split("\u001e")
+    var incoming = []
+    var sawReports = false
+    for (var d = 0; d < docs.length; d++) {
+      var chunk = docs[d].trim()
+      if (chunk === "") continue
+      var parsed
+      try {
+        parsed = JSON.parse(chunk)
+      } catch (error) {
+        console.warn("omp-usage", error)
+        continue
+      }
+      if (Array.isArray(parsed.entries)) {
+        history = indexHistory(parsed.entries)
+        continue
+      }
+      sawReports = true
+      if (Array.isArray(parsed.reports)) incoming = incoming.concat(parsed.reports)
+      var unreported = Array.isArray(parsed.accountsWithoutUsage) ? parsed.accountsWithoutUsage : []
+      for (var k = 0; k < unreported.length; k++) incoming.push(accountWithoutUsage(unreported[k]))
+    }
+    nowMs = Date.now()
+    if (!sawReports && (request.full || request.providers.length > 0)) {
       errorText = "Could not read OMP usage data"
-      console.warn("omp-usage", error)
       return
     }
-    var incoming = Array.isArray(parsed.reports) ? parsed.reports.slice() : []
-    var unreported = Array.isArray(parsed.accountsWithoutUsage) ? parsed.accountsWithoutUsage : []
-    for (var k = 0; k < unreported.length; k++) incoming.push(accountWithoutUsage(unreported[k]))
+
     // Never replace a newer report with an older cached one.
     var previous = {}
     for (var i = 0; i < reports.length; i++) previous[reportKey(reports[i])] = reports[i]
+    var incomingKeys = {}
     var merged = []
     for (var j = 0; j < incoming.length; j++) {
-      var known = previous[reportKey(incoming[j])]
+      var key = reportKey(incoming[j])
+      var known = previous[key]
+      incomingKeys[key] = true
       merged.push(known && !known.noUsage && Number(known.fetchedAt) > Number(incoming[j].fetchedAt) ? known : incoming[j])
     }
+    // A partial pass only covers some providers; keep everything else.
+    if (!request.full)
+      for (var p = 0; p < reports.length; p++)
+        if (!incomingKeys[reportKey(reports[p])]) merged.push(reports[p])
+
+    if (request.full) {
+      lastFullAt = request.startedAt
+      var seen = {}
+      var ids = []
+      for (var m = 0; m < merged.length; m++)
+        if (!merged[m].noUsage && !seen[merged[m].provider]) { seen[merged[m].provider] = true; ids.push(merged[m].provider) }
+      knownProviders = ids
+    }
+    scheduleSlowProviders(request, incoming)
+
+    // Keep a stable account order across partial passes.
+    var order = {}
+    for (var o = 0; o < reports.length; o++) order[reportKey(reports[o])] = o
+    merged.sort(function(a, b) {
+      var ia = order[reportKey(a)], ib = order[reportKey(b)]
+      return (ia === undefined ? 1e9 : ia) - (ib === undefined ? 1e9 : ib)
+    })
     reports = merged
-    nowMs = Date.now()
     errorText = ""
+  }
+
+  // A slow provider that returned a report fetched during this pass is
+  // healthy; one that handed back an older cached report is rate-limited.
+  function scheduleSlowProviders(request, incoming) {
+    var next = Object.assign({}, slowNextAt)
+    var backoff = Object.assign({}, slowBackoffMs)
+    var polled = request.full ? knownProviders : request.providers
+    for (var i = 0; i < polled.length; i++) {
+      var id = polled[i]
+      if (!slowProviders[id]) continue
+      var fresh = false
+      for (var j = 0; j < incoming.length; j++)
+        if (incoming[j].provider === id && Number(incoming[j].fetchedAt) >= request.startedAt - 5000) fresh = true
+      backoff[id] = fresh ? slowIntervalMs : Math.min(slowMaxBackoffMs, Math.max(slowIntervalMs, Number(backoff[id] || 0)) * 2)
+      next[id] = Date.now() + backoff[id]
+    }
+    slowNextAt = next
+    slowBackoffMs = backoff
   }
 
   Component.onCompleted: refresh()
@@ -196,8 +354,9 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  // Open: live view. Each tick is a real provider request (OMP does not
-  // cache between calls); refresh() skips a tick while one is in flight.
+  // Open: live view every 3s for providers that tolerate it; slow providers
+  // join a tick only when their own schedule is due. refresh() skips a tick
+  // while a pass is still running.
   Timer {
     interval: 3000
     running: root.opened
@@ -210,10 +369,9 @@ Panel {
 
   Process {
     id: usageProcess
-    command: ["omp", "usage", "--json"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.parseUsage(text)
+      onStreamFinished: root.parseBatch(text)
     }
     stderr: StdioCollector {
       waitForEnd: true
@@ -299,13 +457,13 @@ Panel {
           }
 
           Repeater {
-            model: root.reports
+            model: root.displayReports
             ProviderSection {
               // Index into the JS array: modelData would be converted to a
               // QVariantMap whose nested lists fail Array.isArray.
               required property int index
               width: parent.width
-              report: root.reports[index]
+              report: root.displayReports[index]
             }
           }
 
@@ -436,7 +594,7 @@ Panel {
       visible: text !== ""
       width: parent.width
       text: root.staleText(section.report)
-      color: root.urgent
+      color: root.staleUrgent(section.report) ? root.urgent : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
       wrapMode: Text.WordWrap
