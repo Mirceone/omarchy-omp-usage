@@ -21,6 +21,8 @@ import urllib.request
 
 DB = os.path.expanduser("~/.omp/agent/agent.db")
 TIMEOUT = 8
+# Plan lookups return a small JSON profile; anything larger is not what we asked for.
+MAX_RESPONSE_BYTES = 1 << 20
 
 CLAUDE_TYPES = {
     "claude_pro": "Pro",
@@ -41,10 +43,23 @@ CURSOR_TYPES = {
 }
 
 
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: urllib would forward Authorization/Cookie to the new host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(RejectRedirects)
+
+
 def get_json(url, headers):
     request = urllib.request.Request(url, headers={"Accept": "application/json", **headers})
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        return json.load(response)
+    with OPENER.open(request, timeout=TIMEOUT) as response:
+        body = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise ValueError(f"{url}: response exceeds {MAX_RESPONSE_BYTES} bytes")
+    return json.loads(body)
 
 
 def claude_plan(data):

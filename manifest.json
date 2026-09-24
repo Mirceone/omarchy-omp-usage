@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omp.usage-monitor",
   "name": "OMP Usage",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Mirceone",
   "license": "MIT",
   "description": "Signal-bar usage meter for every AI subscription logged in to Oh My Pi: limits, plans, and resets in one panel.",
