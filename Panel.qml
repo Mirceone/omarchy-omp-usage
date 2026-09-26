@@ -407,7 +407,8 @@ Panel {
     if (!(at > 0)) return ""
     var age = nowMs - at
     if (age >= 2 * 3600000) return "Provider unreachable · last update " + formatDuration(age) + " ago"
-    if (age >= 90000) return "Updated " + formatDuration(age) + " ago"
+    // Only once a scheduled poll has been missed; data this old is expected otherwise.
+    if (age >= refreshIntervalSec * 1000 + 60000) return "Updated " + formatDuration(age) + " ago"
     return ""
   }
 
@@ -542,32 +543,33 @@ Panel {
     refresh()
     refreshPlans()
   }
+  // Opening the panel is the moment fresh numbers matter: refresh now and
+  // start the periodic interval over from here.
   onOpenedChanged: if (opened) {
     nowMs = Date.now()
     refresh()
+    usageTimer.restart()
+    checkAccountsNow()
     if (nowMs - plansFetchedAt > 3600000) refreshPlans()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
-  // Closed: keep the bar icon's alarm state current at the configured pace.
+  // Usage is polled only at the configured pace (default 5 minutes), open or
+  // closed. Slow providers still join a pass only when their schedule is due.
   Timer {
+    id: usageTimer
     interval: root.refreshIntervalSec * 1000
-    running: !root.opened
+    running: true
     repeat: true
     onTriggered: root.refresh()
   }
 
-  // Open: live view every 3s for providers that tolerate it; slow providers
-  // join a tick only when their own schedule is due. refresh() skips a tick
-  // while a pass is still running.
+  // Open: keep "Resets in" / "Updated ago" ticking. Clock only, no processes.
   Timer {
-    interval: 3000
+    interval: 30000
     running: root.opened
     repeat: true
-    onTriggered: {
-      root.nowMs = Date.now()
-      root.refresh()
-    }
+    onTriggered: root.nowMs = Date.now()
   }
 
   Process {
@@ -622,12 +624,17 @@ Panel {
     }
   }
 
+  function checkAccountsNow() {
+    if (!accountsProcess.running) accountsProcess.running = true
+  }
+
+  // One tiny read-only query; logins and logouts show up within this interval.
   Timer {
-    interval: 5000
+    interval: 30000
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: if (!accountsProcess.running) accountsProcess.running = true
+    onTriggered: root.checkAccountsNow()
   }
 
   FileView {
@@ -782,7 +789,7 @@ Panel {
             }
           }
 
-          // Keyed model: sections survive the 3s refreshes (a plain JS-array
+          // Keyed model: sections survive refreshes (a plain JS-array
           // model would rebuild them all, killing any drag in progress).
           Repeater {
             id: sectionRepeater
@@ -817,7 +824,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Updates every 3s · drag a name to reorder"
+            text: "Updates on open and every " + root.formatDuration(root.refreshIntervalSec * 1000) + " · drag a name to reorder"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
