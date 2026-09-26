@@ -36,6 +36,12 @@ Panel {
   property int dropIndex: -1
 
   readonly property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy/omp-usage-monitor.json"
+  readonly property string credentialStore: Quickshell.env("HOME") + "/.omp/agent/agent.db"
+  // Identity of every enabled OMP credential (no secrets); a change means an
+  // account was logged in or out. null until the first read.
+  property var accountsSignature: null
+  // Re-run discovery as soon as the in-flight usage pass finishes.
+  property bool rediscoverQueued: false
 
   readonly property var displayReports: {
     var list = reports.map(withHistory)
@@ -277,6 +283,29 @@ Panel {
     pending = { full: full, providers: full ? knownProviders.slice() : providers, startedAt: now }
     usageProcess.command = ["bash", "-c", batchScript, "omp-usage"].concat(full ? ["--all"] : providers)
     usageProcess.running = true
+  }
+
+  // A full pass replaces the account list, so logins and logouts show up
+  // (and removed accounts disappear) without waiting for periodic discovery.
+  function rediscover() {
+    if (usageProcess.running) {
+      rediscoverQueued = true
+      return
+    }
+    rediscoverQueued = false
+    lastFullAt = 0
+    refresh()
+  }
+
+  function checkAccounts(text) {
+    var out = String(text || "")
+    // No "ok" line: store missing, locked, or sqlite3 failed. Keep the current view.
+    if (out.indexOf("ok") !== 0) return
+    var signature = out.slice(2).trim()
+    if (signature === accountsSignature) return
+    var first = accountsSignature === null
+    accountsSignature = signature
+    if (!first) rediscover()
   }
 
   // Runs the requested OMP calls in parallel plus the local history read,
@@ -545,7 +574,10 @@ Panel {
     id: usageProcess
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.parseBatch(text)
+      onStreamFinished: {
+        root.parseBatch(text)
+        if (root.rediscoverQueued) Qt.callLater(root.rediscover)
+      }
     }
     stderr: StdioCollector {
       waitForEnd: true
@@ -571,6 +603,31 @@ Panel {
       waitForEnd: true
       onStreamFinished: if (text.trim() !== "") console.warn("omp-usage plans", text.trim())
     }
+  }
+
+  // Enabled credentials in OMP's store, read-only. Credential rows change on
+  // login and logout (and token refresh, which leaves this signature alone).
+  Process {
+    id: accountsProcess
+    command: ["sqlite3", "-readonly", "-noheader", "-cmd", ".timeout 1000", root.credentialStore,
+      "select 'ok' || coalesce(group_concat(id || ':' || provider || ':' || credential_type || ':' || coalesce(identity_key, ''), ' '), '')"
+      + " from (select id, provider, credential_type, identity_key from auth_credentials where disabled_cause is null order by id)"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.checkAccounts(text)
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim() !== "") console.warn("omp-usage accounts", text.trim())
+    }
+  }
+
+  Timer {
+    interval: 5000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: if (!accountsProcess.running) accountsProcess.running = true
   }
 
   FileView {
