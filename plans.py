@@ -11,8 +11,10 @@ plus "<provider>|*" when a provider has exactly one account.
 """
 
 import base64
+import contextlib
 import json
 import os
+import signal
 import sqlite3
 import sys
 import time
@@ -20,6 +22,8 @@ import urllib.parse
 import urllib.request
 
 DB = os.path.expanduser("~/.omp/agent/agent.db")
+# Seconds: socket inactivity timeout and total deadline for each lookup, so a
+# provider trickling bytes cannot keep this helper running.
 TIMEOUT = 8
 # Plan lookups return a small JSON profile; anything larger is not what we asked for.
 MAX_RESPONSE_BYTES = 1 << 20
@@ -53,9 +57,25 @@ class RejectRedirects(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(RejectRedirects)
 
 
+@contextlib.contextmanager
+def deadline(seconds):
+    """Raise TimeoutError in the block once `seconds` of wall time have passed."""
+
+    def expire(signum, frame):
+        raise TimeoutError(f"no complete response within {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def get_json(url, headers):
     request = urllib.request.Request(url, headers={"Accept": "application/json", **headers})
-    with OPENER.open(request, timeout=TIMEOUT) as response:
+    with deadline(TIMEOUT), OPENER.open(request, timeout=TIMEOUT) as response:
         body = response.read(MAX_RESPONSE_BYTES + 1)
     if len(body) > MAX_RESPONSE_BYTES:
         raise ValueError(f"{url}: response exceeds {MAX_RESPONSE_BYTES} bytes")
