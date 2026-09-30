@@ -7,13 +7,13 @@ Subscription limits for every AI account logged in to [Oh My Pi](https://github.
 ## Features
 
 - **Signal-bar icon.** A dual-SIM style meter: the top row of bars is your first account, the bottom row of squares is your second. More lit means more left; a row turns red at 90% used. Hover for what's left on every account.
-- **Every account in one panel.** Codex, Claude, Cursor, Copilot, Gemini — whatever OMP reports — with usage bars, spend amounts, and reset times. Accounts whose provider doesn't report usage are listed with a note.
+- **Grouped by provider, then quota period, then account.** Each level is a collapsible header with its own summary (provider: account count + worst usage; period: quota left + earliest reset; account: email + plan + that period's usage). Collapse state is remembered across restarts.
+- **Every account in one panel.** Codex, Claude, Cursor, Copilot, Gemini — whatever OMP reports — with usage bars, spend amounts, and reset times. Each account card shows its email and plan name, and each limit row is labelled with its quota period (Weekly, 5 Hour, …). Shared pools reported once per model family appear as a single row. Accounts whose provider doesn't report usage are listed with a note.
 - **Exact plans.** "Plus plan", "Pro plan", "Max 20x plan" where the provider exposes it; otherwise "Subscription" or "API key".
 - **Light on your system.** Usage is checked when you open the panel and every 5 minutes (configurable), nothing more.
 - **Accounts come and go on their own.** Log in or out of an account in OMP and it appears in (or disappears from) the panel and icon within 30 seconds, or right away when you open the panel.
 - **Rate-limit aware.** Anthropic throttles its usage endpoint, so Claude is polled at most once a minute with backoff, and OMP's recorded usage fills the gaps. Stale data is labelled, never shown as current.
-- **Drag to reorder.** Drag an account's name in the panel; the order also decides which accounts the icon shows.
-
+- **Drag to reorder.** Drag an account within its period list to reorder; the new order is saved to state and decides which accounts the dual-SIM bar icon shows.
 ## Requirements
 
 - Omarchy with the Quickshell shell
