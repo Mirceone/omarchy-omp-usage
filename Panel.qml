@@ -32,8 +32,22 @@ Panel {
   property var plans: ({})
   // Account keys in the order the user dragged them into (persisted).
   property var savedOrder: []
+  // Collapsed group headers, persisted. Keys: "g|<provider>",
+  // "w|<provider>|<periodId>", "a|<provider>|<periodId>|<accountKey>".
+  property var collapsed: ({})
   property string dragKey: ""
+  // Period ("w|…") the dragged account is being moved in.
+  property string dragPeriod: ""
   property int dropIndex: -1
+  // Drop-line Y in `column` coordinates, set by the dragged account card.
+  property real dropY: 0
+  // Provider -> period -> account nesting derived from displayReports.
+  // Rebuilt on data/order changes only; collapsing toggles visibility.
+  property var groups: []
+  // Layout constants for the three grouping levels.
+  readonly property real periodIndent: Style.space(12)
+  readonly property real accountIndent: Style.space(24)
+  readonly property real chevW: Math.ceil(Style.font.body * 0.9)
 
   readonly property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy/omp-usage-monitor.json"
   readonly property string credentialStore: Quickshell.env("HOME") + "/.omp/agent/agent.db"
@@ -44,7 +58,7 @@ Panel {
   property bool rediscoverQueued: false
 
   readonly property var displayReports: {
-    var list = reports.map(withHistory)
+    var list = reports.map(withHistory).map(dedupeShared)
     var rank = {}
     for (var i = 0; i < savedOrder.length; i++) rank[savedOrder[i]] = i
     var position = {}
@@ -57,18 +71,29 @@ Panel {
     })
   }
 
-  readonly property var reportsByKey: {
-    var map = {}
-    for (var i = 0; i < displayReports.length; i++) map[reportKey(displayReports[i])] = displayReports[i]
-    return map
+  function groupByKey(key) {
+    for (var i = 0; i < groups.length; i++)
+      if ("g|" + groups[i].provider === key) return groups[i]
+    return null
   }
 
-  onDisplayReportsChanged: syncSections()
+  // Account keys of one period ("w|<provider>|<periodId>"), in panel order.
+  function visiblePeriodAccounts(periodKey) {
+    for (var i = 0; i < groups.length; i++) {
+      var periods = groups[i].periods || []
+      for (var j = 0; j < periods.length; j++)
+        if (periods[j].key === periodKey)
+          return periods[j].accounts.map(function(a) { return a.key })
+    }
+    return []
+  }
 
-  // Bring sectionModel to the displayReports order with moves/inserts/removes
-  // only, so existing section delegates are kept rather than recreated.
+  onDisplayReportsChanged: { rebuildGroups(); syncSections() }
+
+  // Bring sectionModel to the provider order with moves/inserts/removes
+  // only, so existing provider delegates are kept rather than recreated.
   function syncSections() {
-    var keys = displayReports.map(reportKey)
+    var keys = groups.map(function(g) { return "g|" + g.provider })
     for (var i = 0; i < keys.length; i++) {
       if (i < sectionModel.count && sectionModel.get(i).key === keys[i]) continue
       var found = -1
@@ -78,6 +103,113 @@ Panel {
       else sectionModel.insert(i, { key: keys[i] })
     }
     while (sectionModel.count > keys.length) sectionModel.remove(sectionModel.count - 1)
+  }
+
+  // Provider -> period -> account nesting for the panel. Order inside every
+  // level follows displayReports, so a drag reorder shows up in all of them.
+  function rebuildGroups() {
+    var result = []
+    var seen = {}
+    for (var i = 0; i < displayReports.length; i++) {
+      var r = displayReports[i]
+      var g = seen[r.provider]
+      if (!g) { g = { provider: r.provider, periods: [] }; seen[r.provider] = g; result.push(g) }
+      addToPeriods(g, r)
+    }
+    groups = result
+  }
+
+  function addToPeriods(group, report) {
+    var buckets = {}
+    var order = []
+    var limits = report.limits || []
+    if (report.noUsage || limits.length === 0) {
+      buckets["none"] = []
+      order.push("none")
+    } else {
+      for (var i = 0; i < limits.length; i++) {
+        var pid = periodId(limits[i])
+        if (!buckets[pid]) { buckets[pid] = []; order.push(pid) }
+        buckets[pid].push(limits[i])
+      }
+    }
+    for (var j = 0; j < order.length; j++) {
+      var entry = accountEntry(report, buckets[order[j]])
+      var existing = null
+      for (var k = 0; k < group.periods.length; k++)
+        if (group.periods[k].id === order[j]) { existing = group.periods[k]; break }
+      if (existing) existing.accounts.push(entry)
+      else group.periods.push(newPeriod(group.provider, order[j], buckets[order[j]][0] || null, entry))
+    }
+  }
+
+  function newPeriod(provider, pid, sample, firstEntry) {
+    return {
+      key: "w|" + provider + "|" + pid,
+      id: pid,
+      label: periodLabel(pid, sample),
+      accounts: [firstEntry]
+    }
+  }
+
+
+  function accountEntry(report, limits) {
+    var metadata = report.metadata || {}
+    return {
+      key: reportKey(report),
+      report: report,
+      email: String(metadata.email || metadata.accountId || ""),
+      limits: limits,
+      noUsage: !!report.noUsage,
+      resetCount: report && report.resetCredits ? Number(report.resetCredits.availableCount) || 0 : 0
+    }
+  }
+
+  function periodId(limit) {
+    var w = (limit && limit.window) || {}
+    var scope = (limit && limit.scope) || {}
+    return String(w.id || scope.windowId || "other")
+  }
+
+  function periodLabel(pid, sample) {
+    if (pid === "none") return "No usage reported"
+    var w = (sample && sample.window) || {}
+    if (w.label) return String(w.label)
+    return String(pid || "Other").split(/[-_]/).map(function(part) {
+      return part ? part[0].toUpperCase() + part.slice(1) : ""
+    }).join(" ")
+  }
+
+  // OMP reports a shared pool once per model family (e.g. an anthropic row
+  // and an openai row with the same sharedGroup and identical figures): one
+  // pool, one row. Keeps the first occurrence.
+  function dedupeShared(report) {
+    if (!report || report.noUsage || !Array.isArray(report.limits)) return report
+    var seen = {}
+    var limits = []
+    for (var i = 0; i < report.limits.length; i++) {
+      var l = report.limits[i]
+      var scope = l.scope || {}
+      var key = scope.sharedGroup ? "shared|" + scope.sharedGroup + "|" + periodId(l) : String(l.id)
+      if (seen[key]) continue
+      seen[key] = true
+      limits.push(l)
+    }
+    return Object.assign({}, report, { limits: limits })
+  }
+
+  function isCollapsed(key) { return !!collapsed[key] }
+
+  function toggleGroup(key) {
+    var next = Object.assign({}, collapsed)
+    if (next[key]) delete next[key]
+    else next[key] = true
+    collapsed = next
+    saveState()
+  }
+
+  function saveState() {
+    stateFile.setText(JSON.stringify({ order: savedOrder, collapsed: collapsed }, null, 2) + "\n")
   }
 
   ListModel { id: sectionModel }
@@ -138,11 +270,24 @@ Panel {
   readonly property string meterTooltip: {
     var parts = []
     for (var i = 0; i < displayReports.length; i++) {
-      var used = worstUsed(displayReports[i])
-      if (used !== undefined)
-        parts.push(providerName(displayReports[i].provider) + " " + Math.round(Math.max(0, 1 - used) * 100) + "% left")
+      var r = displayReports[i]
+      if (r.noUsage) continue
+      var status = root.accountSummary({ report: r, limits: r.limits })
+      if (status) parts.push(shortAccount(r) + ": " + status)
     }
     return parts.length > 0 ? parts.join(" · ") : "OMP Usage"
+  }
+
+  // "saputraedooo11@gmail.com" -> "saputraedooo1…"; falls back to the
+  // provider name when the account reports no identity.
+  function shortAccount(report) {
+    var metadata = report && report.metadata ? report.metadata : {}
+    var email = String(metadata.email || metadata.accountId || "")
+    if (email) {
+      var local = email.split("@")[0] || email
+      return local.length > 14 ? local.slice(0, 13) + "…" : local
+    }
+    return providerName(report && report.provider)
   }
 
   implicitWidth: button.implicitWidth
@@ -186,35 +331,51 @@ Panel {
     return ""
   }
 
-  // Clear drag state before reordering: the reorder moves the very section
-  // whose mouse handler is calling this.
+  // Clear drag state before reordering: the reorder moves the very account
+  // card whose mouse handler is calling this.
   function finishDrag(commit) {
     var key = dragKey
+    var period = dragPeriod
     var index = dropIndex
     dragKey = ""
+    dragPeriod = ""
     dropIndex = -1
-    if (commit && key !== "" && index >= 0) Qt.callLater(function() { root.moveReport(key, index) })
+    if (commit && key !== "" && period !== "" && index >= 0)
+      Qt.callLater(function() { root.moveReportWithinPeriod(period, key, index) })
   }
 
-  function moveReport(key, toIndex) {
-    var order = displayReports.map(reportKey)
-    var from = order.indexOf(key)
+  // Reorder one account inside its period. The panel order is global, so the
+  // period's subsequence is reordered in place while every other account
+  // keeps its position.
+  function moveReportWithinPeriod(periodKey, key, toIndex) {
+    var members = visiblePeriodAccounts(periodKey)
+    var from = members.indexOf(key)
     if (from < 0 || toIndex < 0) return
-    order.splice(from, 1)
-    order.splice(toIndex > from ? toIndex - 1 : toIndex, 0, key)
+    // dropIndex is an insertion slot in the un-removed list: dropping back
+    // on the dragged card's own slot(s) is a no-op.
+    if (toIndex === from || toIndex === from + 1) return
+    members.splice(from, 1)
+    members.splice(toIndex > from ? toIndex - 1 : toIndex, 0, key)
+    var order = []
+    var queue = members.slice()
+    var current = displayReports.map(reportKey)
+    for (var i = 0; i < current.length; i++)
+      order.push(members.indexOf(current[i]) >= 0 ? queue.shift() : current[i])
     // Keep positions of accounts that are not logged in right now.
-    for (var i = 0; i < savedOrder.length; i++)
-      if (order.indexOf(savedOrder[i]) < 0) order.push(savedOrder[i])
+    for (var j = 0; j < savedOrder.length; j++)
+      if (order.indexOf(savedOrder[j]) < 0) order.push(savedOrder[j])
     savedOrder = order
-    stateFile.setText(JSON.stringify({ order: order }, null, 2) + "\n")
+    saveState()
   }
 
   function loadState(text) {
     try {
       var state = JSON.parse(String(text || "{}"))
       savedOrder = Array.isArray(state.order) ? state.order : []
+      collapsed = state.collapsed && typeof state.collapsed === "object" ? state.collapsed : ({})
     } catch (error) {
       savedOrder = []
+      collapsed = ({})
     }
   }
 
@@ -511,24 +672,161 @@ Panel {
     slowBackoffMs = backoff
   }
 
-  // Insertion index (0..count) for a drag at `y` in column coordinates.
-  function dropIndexAt(y) {
-    for (var i = 0; i < sectionRepeater.count; i++) {
-      var item = sectionRepeater.itemAt(i)
-      if (item && y < item.y + item.height / 2) return i
-    }
-    return sectionRepeater.count
+  // Short model name for compact badges: "Claude/GPT", "Gemini", "Claude", etc.
+  function shortModelName(label) {
+    var s = String(label || "")
+    if (s.indexOf("Claude") >= 0 && s.indexOf("GPT") >= 0) return "Claude/GPT"
+    if (s.indexOf("Claude") >= 0) return "Claude"
+    if (s.indexOf("Gemini") >= 0) return "Gemini"
+    if (s.indexOf("Codex") >= 0) return "Codex"
+    return s.split("·")[0].split("(")[0].trim().slice(0, 10)
   }
 
-  function dropLineY(index) {
-    var count = sectionRepeater.count
-    if (index < 0 || count === 0) return 0
-    if (index < count) {
-      var item = sectionRepeater.itemAt(index)
-      return item ? item.y - column.spacing / 2 : 0
+  // Provider header summary: "5 accounts · 2 active" or "5 accounts · all exhausted".
+  function providerSummary(group) {
+    if (!group) return ""
+    var uniqueAccounts = {}
+    var activeAccounts = {}
+    var periods = group.periods || []
+    for (var p = 0; p < periods.length; p++) {
+      var accts = periods[p].accounts || []
+      for (var a = 0; a < accts.length; a++) {
+        var key = accts[a].key
+        uniqueAccounts[key] = true
+        if (!accountAlarming(accts[a])) activeAccounts[key] = true
+      }
     }
-    var last = sectionRepeater.itemAt(count - 1)
-    return last ? last.y + last.height + column.spacing / 2 : 0
+    var total = Object.keys(uniqueAccounts).length
+    var active = Object.keys(activeAccounts).length
+    var countText = total + (total === 1 ? " account" : " accounts")
+    if (total === 0) return ""
+    if (active === 0) return countText + " · all exhausted"
+    if (active === total) return countText + " · all active"
+    return countText + " · " + active + " active"
+  }
+
+  function providerAlarming(group) {
+    if (!group) return false
+    var periods = group.periods || []
+    var anyActive = false
+    var anyAccount = false
+    for (var p = 0; p < periods.length; p++) {
+      var accts = periods[p].accounts || []
+      for (var a = 0; a < accts.length; a++) {
+        anyAccount = true
+        if (!accountAlarming(accts[a])) anyActive = true
+      }
+    }
+    return anyAccount && !anyActive
+  }
+
+  // Period header summary: "2/5 active · Resets in 17h 30m" or "all 2 active · Resets in 4h".
+  function periodSummary(period) {
+    if (!period) return ""
+    var accounts = period.accounts || []
+    var total = accounts.length
+    if (total === 0) return ""
+    var active = 0
+    var resetAt = 0
+    for (var i = 0; i < total; i++) {
+      if (!accountAlarming(accounts[i])) active++
+      var limits = accounts[i].limits || []
+      for (var j = 0; j < limits.length; j++) {
+        if (windowExpired(limits[j])) continue
+        var at = Number(limits[j].window && limits[j].window.resetsAt) || 0
+        if (at > 0 && (resetAt === 0 || at < resetAt)) resetAt = at
+      }
+    }
+    var status = active === 0 ? "all exhausted" : (active === total ? "all " + total + " active" : active + "/" + total + " active")
+    var parts = [status]
+    if (resetAt > 0) parts.push("Resets in " + formatDuration(resetAt - nowMs))
+    return parts.join(" · ")
+  }
+
+  function periodAlarming(period) {
+    if (!period) return false
+    var accounts = period.accounts || []
+    if (accounts.length === 0) return false
+    for (var i = 0; i < accounts.length; i++) {
+      if (!accountAlarming(accounts[i])) return false
+    }
+    return true
+  }
+
+  function accountCollapseKey(periodKey, entryKey) { return "a|" + periodKey + "|" + entryKey }
+
+  // Account card summary:
+  // - single limit: "70% left" (or "exhausted")
+  // - mixed (1 available, others exhausted): "Gemini 70% left"
+  // - all exhausted: "exhausted"
+  // - multiple available: "Claude/GPT 80% · Gemini 60% left"
+  function accountSummary(entry) {
+    if (!entry || entry.noUsage) return ""
+    var limits = aggregateLimits(entry.limits || [])
+    if (limits.length === 0) return ""
+    var avail = []
+    var exhCount = 0
+    for (var i = 0; i < limits.length; i++) {
+      var l = limits[i]
+      if (windowExpired(l)) continue
+      var u = usedFraction(l)
+      if (u === undefined || isNaN(u)) continue
+      var lbl = shortModelName(l.label || (l.window && l.window.label))
+      var left = Math.max(0, 1 - u)
+      if (u >= 0.999) {
+        exhCount++
+      } else {
+        avail.push({ label: lbl, leftPct: Math.round(left * 100) })
+      }
+    }
+    if (avail.length === 0) return "exhausted"
+    if (avail.length === 1 && exhCount === 0) return avail[0].leftPct + "% left"
+    if (avail.length === 1 && exhCount > 0) return avail[0].label + " " + avail[0].leftPct + "% left"
+    var parts = []
+    for (var j = 0; j < avail.length; j++) {
+      parts.push(avail[j].label + " " + avail[j].leftPct + "%")
+    }
+    return parts.join(" · ") + " left"
+  }
+
+  function accountAlarming(entry) {
+    if (!entry || entry.noUsage) return false
+    var limits = aggregateLimits(entry.limits || [])
+    if (limits.length === 0) return false
+    var anyAvailable = false
+    var anySafe = false
+    for (var i = 0; i < limits.length; i++) {
+      var l = limits[i]
+      if (windowExpired(l)) continue
+      var u = usedFraction(l)
+      if (u === undefined || isNaN(u)) continue
+      if (u < 0.999) anyAvailable = true
+      if (u < 0.9) anySafe = true
+    }
+    if (!anyAvailable) return true
+    return !anySafe
+  }
+
+  // Same model label repeated inside one period (e.g. two "Gemini" rows on
+  // one account): aggregate the identical figures into one LimitRow so the
+  // card shows one bar per quota instead of one per raw limit row.
+  function aggregateLimits(limits) {
+    var result = []
+    var indexByLabel = {}
+    for (var i = 0; i < (limits || []).length; i++) {
+      var l = limits[i]
+      var label = String((l && (l.label || (l.window && l.window.label))) || "Usage")
+      var at = Number(l && l.window && l.window.resetsAt) || 0
+      if (indexByLabel[label] === undefined) {
+        indexByLabel[label] = result.length
+        result.push(l)
+        continue
+      }
+      var keep = result[indexByLabel[label]]
+      var keepAt = Number(keep && keep.window && keep.window.resetsAt) || 0
+      if (at > 0 && (keepAt === 0 || at < keepAt)) result[indexByLabel[label]] = l
+    }
+    return result
   }
 
   // Plans change rarely: look them up at start, then at most hourly on open.
@@ -755,17 +1053,19 @@ Panel {
         interactive: contentHeight > height
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-        // Where a dragged account will land.
+        // Where a dragged account will land (inside its period list).
         Rectangle {
+          id: dropLine
           z: 2
           visible: root.dragKey !== "" && root.dropIndex >= 0
-          x: 0
-          width: panelFlick.width
+          x: root.accountIndent
+          width: panelFlick.width - root.accountIndent
           height: Math.max(2, Style.space(2))
           radius: height / 2
           color: Color.accent
-          y: root.dropLineY(root.dropIndex) - height / 2
+          y: root.dropY - height / 2
         }
+
 
         Column {
           id: column
@@ -775,7 +1075,7 @@ Panel {
           PanelHero {
             width: parent.width
             title: "OMP Usage"
-            meta: root.reports.length === 1 ? "Oh My Pi · 1 account" : "Oh My Pi · " + root.reports.length + " accounts"
+            meta: "Oh My Pi · " + root.groups.length + (root.groups.length === 1 ? " provider · " : " providers · ") + root.displayReports.length + (root.displayReports.length === 1 ? " account" : " accounts")
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
@@ -789,16 +1089,15 @@ Panel {
             }
           }
 
-          // Keyed model: sections survive refreshes (a plain JS-array
-          // model would rebuild them all, killing any drag in progress).
+          // Keyed by provider: delegates survive data refreshes (a plain
+          // JS-array model would rebuild them all, killing any drag).
           Repeater {
             id: sectionRepeater
             model: sectionModel
-            ProviderSection {
+            ProviderGroup {
               required property string key
-              width: parent.width
-              accountKey: key
-              report: root.reportsByKey[key] || null
+              width: column.width
+              provider: root.groupByKey(key)
             }
           }
 
@@ -824,7 +1123,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Updates on open and every " + root.formatDuration(root.refreshIntervalSec * 1000) + " · drag a name to reorder"
+            text: "Updates on open and every " + root.formatDuration(root.refreshIntervalSec * 1000) + " · drag an account within its period to reorder"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -835,139 +1134,349 @@ Panel {
     }
   }
 
-  component ProviderSection: Column {
-    id: section
-    property var report: null
-    property string accountKey: ""
-    readonly property bool dragging: root.dragKey !== "" && root.dragKey === accountKey
-    // Follows the pointer while dragging; the drop line shows the landing spot.
-    property real dragOffset: 0
-    z: dragging ? 10 : 0
-    opacity: dragging ? 0.6 : 1
-    transform: Translate { y: section.dragging ? section.dragOffset : 0 }
-    readonly property string iconSource: report ? root.providerIcon(report.provider) : ""
-    readonly property int resetCount: report && report.resetCredits ? Number(report.resetCredits.availableCount) || 0 : 0
-    spacing: Style.space(10)
-
-    PanelSeparator { width: parent.width; foreground: root.foreground }
-
+  // Clickable row shared by all three grouping levels: chevron,
+  // title, optional email, and a dim summary on the right. Clicking
+  // toggles; dragging only exists on the account row.
+  component GroupHeader: Item {
+    id: header
+    property string chevron: "▾"
+    property string title: ""
+    property string email: ""
+    property string summary: ""
+    property bool alarming: false
+    property string iconSource: ""
+    property string initial: ""
+    property real indent: 0
+    signal pressed
+    width: parent ? parent.width : 0
+    implicitHeight: Math.max(titleLine.implicitHeight, Math.max(iconBox.height, chev.implicitHeight))
+    Text {
+      id: chev
+      anchors.left: parent.left
+      anchors.leftMargin: header.indent
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.chevW
+      text: header.chevron
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      horizontalAlignment: Text.AlignHCenter
+    }
     Item {
-      width: parent.width
-      implicitHeight: Math.max(name.implicitHeight, icon.height)
-
-      // Press and drag the header to move this account up or down.
-      MouseArea {
+      id: iconBox
+      anchors.left: chev.right
+      anchors.verticalCenter: parent.verticalCenter
+      width: header.iconSource !== "" || header.initial !== "" ? Style.font.body * 1.25 : 0
+      height: width
+      Image {
         anchors.fill: parent
-        z: 1
-        preventStealing: true
-        cursorShape: section.dragging ? Qt.ClosedHandCursor : Qt.OpenHandCursor
-        property real pressY: 0
-        onPressed: function(mouse) {
-          pressY = mapToItem(column, mouse.x, mouse.y).y
-          section.dragOffset = 0
-        }
-        onPositionChanged: function(mouse) {
-          var y = mapToItem(column, mouse.x, mouse.y).y
-          // Small threshold so a plain click is not a drag.
-          if (!section.dragging) {
-            if (Math.abs(y - pressY) < Style.space(4)) return
-            root.dragKey = section.accountKey
-          }
-          section.dragOffset = y - pressY
-          root.dropIndex = root.dropIndexAt(y)
-        }
-        onReleased: root.finishDrag(true)
-        onCanceled: root.finishDrag(false)
-      }
-
-      Item {
-        id: icon
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
-        width: Style.font.body * 1.25
-        height: width
-        Image {
-          anchors.fill: parent
-          visible: section.iconSource !== ""
-          source: section.iconSource
-          sourceSize.width: parent.width * 2
-          sourceSize.height: parent.height * 2
-          fillMode: Image.PreserveAspectFit
-        }
-        // Providers without a bundled logo get their initial instead.
-        Text {
-          anchors.centerIn: parent
-          visible: section.iconSource === ""
-          text: section.report ? root.providerName(section.report.provider).charAt(0) : ""
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
+        visible: header.iconSource !== ""
+        source: header.iconSource
+        sourceSize.width: parent.width * 2
+        sourceSize.height: parent.height * 2
+        fillMode: Image.PreserveAspectFit
       }
       Text {
-        id: name
-        anchors.left: icon.right
-        anchors.leftMargin: Style.spacing.sm
-        anchors.verticalCenter: parent.verticalCenter
-        text: section.report ? root.providerName(section.report.provider) : ""
+        anchors.centerIn: parent
+        visible: header.iconSource === "" && header.initial !== ""
+        text: header.initial
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         font.bold: true
       }
+    }
+    Column {
+      id: titleLine
+      anchors.left: iconBox.right
+      anchors.leftMargin: Style.spacing.sm
+      anchors.right: summaryText.left
+      anchors.rightMargin: Style.spacing.sm
+      anchors.verticalCenter: parent.verticalCenter
       Text {
-        anchors.left: name.right
-        anchors.leftMargin: Style.spacing.sm
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        text: root.planText(section.report)
+        width: parent.width
+        text: header.title
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+        elide: Text.ElideRight
+      }
+      Text {
+        visible: header.email !== ""
+        width: parent.width
+        text: header.email
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
-        horizontalAlignment: Text.AlignRight
-        elide: Text.ElideLeft
+        elide: Text.ElideMiddle
       }
     }
-
-    Repeater {
-      model: section.report && Array.isArray(section.report.limits) ? section.report.limits : []
-      LimitRow {
-        required property var modelData
-        width: section.width
-        limit: modelData
-      }
-    }
-
     Text {
-      visible: !!(section.report && section.report.noUsage)
-      width: parent.width
-      text: section.report ? "Logged in, but " + root.providerName(section.report.provider) + " doesn't report usage to Oh My Pi." : ""
-      color: root.dim
+      id: summaryText
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      text: header.summary
+      color: header.alarming ? root.urgent : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
+      horizontalAlignment: Text.AlignRight
+      elide: Text.ElideLeft
     }
-
-    Text {
-      visible: section.resetCount > 0
-      width: parent.width
-      text: section.resetCount + " saved reset" + (section.resetCount === 1 ? "" : "s")
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-    }
-
-    Text {
-      visible: text !== ""
-      width: parent.width
-      text: root.staleText(section.report)
-      color: root.staleUrgent(section.report) ? root.urgent : root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: header.pressed()
     }
   }
+
+  // One provider: header + its quota periods.
+  component ProviderGroup: Column {
+    id: providerGroup
+    property var provider: null
+    readonly property string providerId: provider ? String(provider.provider) : ""
+    readonly property string groupKey: "g|" + providerId
+    readonly property string iconSource: root.providerIcon(providerId)
+    readonly property bool collapsed: root.isCollapsed(groupKey)
+    spacing: Style.space(10)
+    PanelSeparator { width: parent.width; foreground: root.foreground }
+    GroupHeader {
+      width: parent.width
+      chevron: providerGroup.collapsed ? "▸" : "▾"
+      title: root.providerName(providerGroup.providerId)
+      summary: root.providerSummary(providerGroup.provider)
+      alarming: root.providerAlarming(providerGroup.provider)
+      iconSource: providerGroup.iconSource
+      initial: providerGroup.iconSource === "" ? root.providerName(providerGroup.providerId).charAt(0) : ""
+      onPressed: root.toggleGroup(providerGroup.groupKey)
+    }
+    Column {
+      visible: !providerGroup.collapsed
+      width: parent.width
+      spacing: Style.space(10)
+      Repeater {
+        model: providerGroup.provider ? providerGroup.provider.periods : []
+        PeriodGroup {
+          required property var modelData
+          width: parent.width
+          providerId: providerGroup.providerId
+          period: modelData
+        }
+      }
+    }
+  }
+
+  // One quota period ("Weekly", "5 Hour", …) inside a provider.
+  component PeriodGroup: Column {
+    id: periodGroup
+    property string providerId: ""
+    property var period: null
+    readonly property string periodKey: period ? String(period.key) : ""
+    readonly property bool collapsed: root.isCollapsed(periodKey)
+    readonly property bool alarming: root.periodAlarming(period)
+    spacing: Style.space(8)
+    Item {
+      width: parent.width
+      height: Style.space(4)
+    }
+    GroupHeader {
+      width: parent.width
+      indent: root.periodIndent - root.chevW
+      chevron: periodGroup.collapsed ? "▸" : "▾"
+      title: periodGroup.period ? String(periodGroup.period.label) : ""
+      summary: root.periodSummary(periodGroup.period)
+      alarming: periodGroup.alarming
+      onPressed: root.toggleGroup(periodGroup.periodKey)
+    }
+    Column {
+      id: accountList
+      visible: !periodGroup.collapsed
+      width: parent.width
+      spacing: Style.space(8)
+      Repeater {
+        model: periodGroup.period ? periodGroup.period.accounts : []
+        AccountCard {
+          required property var modelData
+          required property int index
+          width: accountList.width
+          providerId: periodGroup.providerId
+          periodKey: periodGroup.periodKey
+          entry: modelData
+          entryIndex: index
+          entryCount: periodGroup.period ? periodGroup.period.accounts.length : 0
+        }
+      }
+    }
+  }
+
+  // One account inside a period: email + plan + that period's limit rows.
+  // Draggable within its own period list to reorder.
+  component AccountCard: Column {
+    id: card
+    property string providerId: ""
+    property string periodKey: ""
+    property var entry: null
+    property int entryIndex: 0
+    property int entryCount: 1
+    readonly property string entryKey: entry ? String(entry.key) : ""
+    readonly property string collapseKey: root.accountCollapseKey(card.periodKey, card.entryKey)
+    readonly property bool collapsed: root.isCollapsed(card.collapseKey)
+    readonly property bool dragging: root.dragKey !== "" && root.dragKey === card.entryKey && root.dragPeriod === card.periodKey
+    // Follows the pointer while dragging; the drop line shows the landing spot.
+    property real dragOffset: 0
+    z: dragging ? 10 : 0
+    opacity: dragging ? 0.6 : 1
+    transform: Translate { y: card.dragging ? card.dragOffset : 0 }
+    readonly property string summary: root.accountSummary(card.entry)
+    readonly property bool alarming: root.accountAlarming(card.entry)
+    spacing: Style.space(8)
+    Item {
+      width: parent.width
+      implicitHeight: Math.max(headerRow.implicitHeight, Style.font.body * 1.25)
+      Item {
+        id: headerRow
+        anchors.left: parent.left
+        anchors.leftMargin: root.accountIndent - root.chevW
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        implicitHeight: Math.max(cardTitle.implicitHeight, cardChev.implicitHeight)
+        Text {
+          id: cardChev
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          width: root.chevW
+          text: card.collapsed ? "▸" : "▾"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          horizontalAlignment: Text.AlignHCenter
+        }
+        Column {
+          id: cardTitle
+          anchors.left: cardChev.right
+          anchors.leftMargin: Style.spacing.sm
+          anchors.right: cardSummary.left
+          anchors.rightMargin: Style.spacing.sm
+          anchors.verticalCenter: parent.verticalCenter
+          Text {
+            width: parent.width
+            text: card.entry && card.entry.email ? card.entry.email : (card.entry ? root.shortAccount(card.entry.report) : "")
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            elide: Text.ElideMiddle
+          }
+          Text {
+            id: cardEmail
+            visible: text !== ""
+            width: parent.width
+            text: card.entry ? root.planText(card.entry.report) : ""
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideLeft
+          }
+        }
+        Text {
+          id: cardSummary
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          text: card.summary
+          color: card.alarming ? root.urgent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+        MouseArea {
+          anchors.fill: parent
+          preventStealing: true
+          cursorShape: card.dragging ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+          property real pressY: 0
+          property bool held: false
+          onPressed: function(mouse) {
+            held = true
+            pressY = mapToItem(column, mouse.x, mouse.y).y
+            card.dragOffset = 0
+          }
+          onPositionChanged: function(mouse) {
+            if (!held) return
+            var y = mapToItem(column, mouse.x, mouse.y).y
+            if (!card.dragging) {
+              if (Math.abs(y - pressY) < Style.space(4)) return
+              root.dragKey = card.entryKey
+              root.dragPeriod = card.periodKey
+            }
+            card.dragOffset = y - pressY
+            // Pointer minus the press offset inside the card gives the card's
+            // top; each gap between cards is one insertion index.
+            var step = Math.max(1, card.height + Style.space(8))
+            var cardTop = card.mapToItem(column, 0, 0).y
+            var topY = cardTop + (y - pressY)
+            var firstTop = cardTop - card.entryIndex * step
+            root.dropIndex = Math.max(0, Math.min(card.entryCount, Math.round((topY - firstTop) / step)))
+            root.dropY = firstTop + root.dropIndex * step
+          }
+          onReleased: function(mouse) {
+            held = false
+            if (card.dragging) root.finishDrag(true)
+            else if (Math.abs(mapToItem(column, mouse.x, mouse.y).y - pressY) < Style.space(4)) root.toggleGroup(card.collapseKey)
+          }
+          onCanceled: {
+            held = false
+            root.finishDrag(false)
+          }
+        }
+      }
+    }
+    Column {
+      visible: !card.collapsed
+      width: parent.width
+      spacing: Style.space(6)
+      Item {
+        width: parent.width
+        height: 0
+      }
+      Repeater {
+        model: card.entry ? root.aggregateLimits(card.entry.limits) : []
+        LimitRow {
+          required property var modelData
+          width: card.width - root.accountIndent
+          x: root.accountIndent
+          limit: modelData
+        }
+      }
+      Text {
+        visible: !!(card.entry && card.entry.noUsage)
+        width: parent.width - root.accountIndent
+        x: root.accountIndent
+        text: "Logged in, but this provider doesn't report usage to Oh My Pi."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Text {
+        visible: !!(card.entry && card.entry.resetCount > 0)
+        width: parent.width - root.accountIndent
+        x: root.accountIndent
+        text: card.entry.resetCount + " saved reset" + (card.entry.resetCount === 1 ? "" : "s")
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+      Text {
+        visible: text !== ""
+        width: parent.width - root.accountIndent
+        x: root.accountIndent
+        text: card.entry ? root.staleText(card.entry.report) : ""
+        color: card.entry ? (root.staleUrgent(card.entry.report) ? root.urgent : root.dim) : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+    }
+  }
+
 
   component LimitRow: Column {
     id: limitRow
