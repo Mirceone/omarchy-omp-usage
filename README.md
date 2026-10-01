@@ -9,7 +9,7 @@ Subscription limits for every AI account logged in to [Oh My Pi](https://github.
 - **Signal-bar icon.** A dual-SIM style meter: the top row of bars is your first account, the bottom row of squares is your second. More lit means more left; a row turns red at 90% used. Hover for what's left on every account.
 - **Every account in one panel.** Codex, Claude, Cursor, Copilot, Gemini — whatever OMP reports — with usage bars, spend amounts, and reset times. Accounts whose provider doesn't report usage are listed with a note.
 - **Exact plans.** "Plus plan", "Pro plan", "Max 20x plan" where the provider exposes it; otherwise "Subscription" or "API key".
-- **Light on your system.** Usage is checked when you open the panel and every 5 minutes (configurable), nothing more.
+- **Light on your system.** While the panel is open, usage is checked every 30 seconds; while it's closed, only every 5 minutes (configurable).
 - **Accounts come and go on their own.** Log in or out of an account in OMP and it appears in (or disappears from) the panel and icon within 30 seconds, or right away when you open the panel.
 - **Rate-limit aware.** Anthropic throttles its usage endpoint, so Claude is polled at most once a minute with backoff, and OMP's recorded usage fills the gaps. Stale data is labelled, never shown as current.
 - **Drag to reorder.** Drag an account's name in the panel; the order also decides which accounts the icon shows.
@@ -44,7 +44,7 @@ rm -f ~/.local/state/omarchy/omp-usage-monitor.json   # saved account order
 
 ## Settings
 
-`refreshIntervalSec` (default 300): how often usage is checked, besides each time the panel opens.
+`refreshIntervalSec` (default 300): how often usage is checked in the background while the panel is closed. While it's open, usage is checked every 30 seconds, plus once on open.
 
 ## License
 

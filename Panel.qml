@@ -17,6 +17,9 @@ Panel {
   readonly property color track: Style.selectedFillFor(foreground, Color.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property int refreshIntervalSec: Math.max(30, Number(settings && settings.refreshIntervalSec || 300))
+  // While the panel is open, poll this often instead of refreshIntervalSec;
+  // closing it returns to the slower background pace.
+  readonly property int openRefreshIntervalSec: 30
 
   property var reports: []
   property string errorText: ""
@@ -544,21 +547,24 @@ Panel {
     refreshPlans()
   }
   // Opening the panel is the moment fresh numbers matter: refresh now and
-  // start the periodic interval over from here.
-  onOpenedChanged: if (opened) {
+  // start the (faster, open-only) interval over from here. Closing returns to
+  // the background pace, also counted from the moment of closing.
+  onOpenedChanged: {
+    usageTimer.restart()
+    if (!opened) return
     nowMs = Date.now()
     refresh()
-    usageTimer.restart()
     checkAccountsNow()
     if (nowMs - plansFetchedAt > 3600000) refreshPlans()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
-  // Usage is polled only at the configured pace (default 5 minutes), open or
-  // closed. Slow providers still join a pass only when their schedule is due.
+  // Usage is polled every openRefreshIntervalSec while the panel is open and
+  // at the configured background pace (default 5 minutes) while closed. Slow
+  // providers still join a pass only when their schedule is due.
   Timer {
     id: usageTimer
-    interval: root.refreshIntervalSec * 1000
+    interval: (root.opened ? root.openRefreshIntervalSec : root.refreshIntervalSec) * 1000
     running: true
     repeat: true
     onTriggered: root.refresh()
@@ -824,7 +830,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Updates on open and every " + root.formatDuration(root.refreshIntervalSec * 1000) + " · drag a name to reorder"
+            text: "Updates every " + root.openRefreshIntervalSec + "s while open · drag a name to reorder"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
